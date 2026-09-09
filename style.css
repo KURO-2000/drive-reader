@@ -1,0 +1,572 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+}
+
+body {
+  font-family:
+    Arial,
+    "Noto Sans KR",
+    "Noto Sans SC",
+    sans-serif;
+
+  background: #f6ecd8;
+  color: #3f3125;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+.hidden {
+  display: none !important;
+}
+
+
+/* =========================
+   전체
+========================= */
+
+#app {
+  width: 100%;
+  height: 100vh;
+  display: flex;
+}
+
+
+/* =========================
+   사이드바
+========================= */
+
+#sidebar {
+  width: 300px;
+  min-width: 300px;
+  height: 100vh;
+
+  overflow-y: auto;
+
+  padding: 20px;
+
+  background: #efe0c3;
+
+  border-right:
+    1px solid rgba(0,0,0,0.12);
+
+  z-index: 20;
+}
+
+
+.logo {
+  font-size: 22px;
+  font-weight: bold;
+
+  margin-bottom: 20px;
+}
+
+
+.main-button,
+.upload-button {
+  width: 100%;
+
+  display: block;
+
+  padding: 11px 14px;
+
+  margin-bottom: 10px;
+
+  border-radius: 9px;
+
+  border:
+    1px solid rgba(0,0,0,0.2);
+
+  background: rgba(255,255,255,0.45);
+
+  color: inherit;
+
+  text-align: center;
+
+  cursor: pointer;
+}
+
+
+.upload-button input {
+  display: none;
+}
+
+
+.status {
+  font-size: 13px;
+  opacity: 0.7;
+
+  margin-bottom: 20px;
+}
+
+
+.sidebar-section {
+  margin-top: 25px;
+}
+
+
+.section-title {
+  font-size: 14px;
+  font-weight: bold;
+
+  margin-bottom: 10px;
+
+  opacity: 0.8;
+}
+
+
+.search-input {
+  width: 100%;
+
+  padding: 9px 10px;
+
+  border-radius: 8px;
+
+  border:
+    1px solid rgba(0,0,0,0.2);
+
+  margin-bottom: 10px;
+}
+
+
+.book-item,
+.toc-item {
+  width: 100%;
+
+  padding: 10px;
+
+  margin-bottom: 5px;
+
+  border: none;
+
+  border-radius: 8px;
+
+  background: transparent;
+
+  color: inherit;
+
+  text-align: left;
+}
+
+
+.book-item:hover,
+.toc-item:hover {
+  background:
+    rgba(255,255,255,0.35);
+}
+
+
+.book-item.active,
+.toc-item.active {
+  background:
+    rgba(255,255,255,0.55);
+
+  font-weight: bold;
+}
+
+
+/* =========================
+   본문
+========================= */
+
+#readerMain {
+  flex: 1;
+
+  min-width: 0;
+
+  height: 100vh;
+
+  overflow: hidden;
+
+  position: relative;
+}
+
+
+#emptyScreen {
+  height: 100%;
+
+  display: flex;
+
+  flex-direction: column;
+
+  align-items: center;
+
+  justify-content: center;
+
+  text-align: center;
+
+  opacity: 0.65;
+}
+
+
+/* =========================
+   상단툴바
+========================= */
+
+.reader-toolbar {
+  height: 60px;
+
+  display: flex;
+
+  align-items: center;
+
+  justify-content: space-between;
+
+  padding: 0 25px;
+
+  border-bottom:
+    1px solid rgba(0,0,0,0.12);
+}
+
+
+.reader-toolbar button {
+  padding: 7px 12px;
+
+  border: none;
+
+  border-radius: 8px;
+
+  background:
+    rgba(255,255,255,0.4);
+
+  color: inherit;
+}
+
+
+/* =========================
+   TXT
+========================= */
+
+#txtReader {
+  height: 100%;
+
+  display: flex;
+
+  flex-direction: column;
+}
+
+
+#txtScrollArea {
+  flex: 1;
+
+  overflow-y: auto;
+
+  scroll-behavior: smooth;
+}
+
+
+#txtContent {
+  width: min(850px, 90%);
+
+  margin: 0 auto;
+
+  padding:
+    40px 0
+    100px 0;
+
+  white-space: pre-wrap;
+
+  word-break: break-word;
+
+  font-size: 20px;
+
+  line-height: 1.9;
+}
+
+
+/* =========================
+   EPUB
+========================= */
+
+#epubReader {
+  height: 100%;
+
+  display: flex;
+
+  flex-direction: column;
+}
+
+
+#epubViewer {
+  flex: 1;
+
+  min-height: 0;
+
+  width: 100%;
+}
+
+
+/* =========================
+   설정창
+========================= */
+
+.settings-panel {
+  position: fixed;
+
+  top: 20px;
+  right: 20px;
+
+  width: 300px;
+
+  padding: 18px;
+
+  border-radius: 14px;
+
+  background: #ffffff;
+
+  color: #222;
+
+  box-shadow:
+    0 10px 35px
+    rgba(0,0,0,0.25);
+
+  z-index: 100;
+}
+
+
+.settings-header {
+  display: flex;
+
+  justify-content: space-between;
+
+  margin-bottom: 20px;
+}
+
+
+.settings-header button {
+  border: none;
+  background: none;
+}
+
+
+.settings-panel label {
+  display: block;
+
+  margin-bottom: 20px;
+}
+
+
+.settings-panel select,
+.settings-panel input {
+  width: 100%;
+
+  margin-top: 7px;
+}
+
+
+/* =========================
+   모바일 상단
+========================= */
+
+.mobile-header {
+  display: none;
+}
+
+
+.overlay {
+  display: none;
+}
+
+
+/* =========================
+   DARK
+========================= */
+
+body.theme-dark {
+  background: #151515;
+  color: #ededed;
+}
+
+
+body.theme-dark #sidebar {
+  background: #1e1e1e;
+}
+
+
+body.theme-dark .main-button,
+body.theme-dark .upload-button,
+body.theme-dark .reader-toolbar button {
+  background:
+    rgba(255,255,255,0.08);
+
+  border-color:
+    rgba(255,255,255,0.15);
+}
+
+
+body.theme-dark .book-item:hover,
+body.theme-dark .toc-item:hover {
+  background:
+    rgba(255,255,255,0.08);
+}
+
+
+body.theme-dark .book-item.active,
+body.theme-dark .toc-item.active {
+  background:
+    rgba(255,255,255,0.13);
+}
+
+
+/* =========================
+   LIGHT
+========================= */
+
+body.theme-light {
+  background: #ffffff;
+  color: #222222;
+}
+
+
+body.theme-light #sidebar {
+  background: #f3f3f3;
+}
+
+
+/* =========================
+   SEPIA
+========================= */
+
+body.theme-sepia {
+  background: #f6ecd8;
+  color: #3f3125;
+}
+
+
+body.theme-sepia #sidebar {
+  background: #efe0c3;
+}
+
+
+/* =========================
+   모바일
+========================= */
+
+@media (max-width: 800px) {
+
+  #app {
+    display: block;
+  }
+
+
+  .mobile-header {
+    display: flex;
+
+    height: 55px;
+
+    align-items: center;
+
+    justify-content: space-between;
+
+    padding: 0 12px;
+
+    border-bottom:
+      1px solid rgba(0,0,0,0.12);
+  }
+
+
+  .mobile-header button {
+    border: none;
+
+    background: transparent;
+
+    color: inherit;
+
+    font-size: 22px;
+  }
+
+
+  #sidebar {
+    position: fixed;
+
+    left: -310px;
+    top: 0;
+
+    transition: left 0.2s;
+
+    box-shadow:
+      5px 0 20px
+      rgba(0,0,0,0.2);
+  }
+
+
+  #sidebar.open {
+    left: 0;
+  }
+
+
+  #readerMain {
+    height:
+      calc(100vh - 55px);
+  }
+
+
+  .overlay {
+    display: block;
+
+    position: fixed;
+
+    inset: 0;
+
+    background:
+      rgba(0,0,0,0.4);
+
+    z-index: 10;
+  }
+
+
+  .settings-panel {
+    top: 70px;
+
+    left: 5%;
+    right: auto;
+
+    width: 90%;
+  }
+
+
+  #txtContent {
+    width: 88%;
+
+    padding-top: 25px;
+  }
+
+
+  .reader-toolbar {
+    height: 55px;
+
+    padding: 0 10px;
+  }
+
+
+  .reader-toolbar button {
+    font-size: 13px;
+  }
+
+
+  #chapterTitle,
+  #epubTitle {
+    max-width: 45%;
+
+    white-space: nowrap;
+
+    overflow: hidden;
+
+    text-overflow: ellipsis;
+  }
+
+}
