@@ -155,6 +155,12 @@ const menuBtn =
 const sidebar =
   document.getElementById("sidebar");
 
+const collapseSidebarBtn =
+  document.getElementById("collapseSidebarBtn");
+
+const openSidebarBtn =
+  document.getElementById("openSidebarBtn");
+
 const overlay =
   document.getElementById("overlay");
 
@@ -2118,6 +2124,46 @@ function closeSettings() {
   );
 
 }
+
+
+/* =========================================================
+   PC 사이드바 접기 / 펴기
+========================================================= */
+
+collapseSidebarBtn.addEventListener(
+  "click",
+  () => {
+
+    document
+      .getElementById("app")
+      .classList.add(
+        "sidebar-collapsed"
+      );
+
+    openSidebarBtn.classList.remove(
+      "hidden"
+    );
+
+  }
+);
+
+
+openSidebarBtn.addEventListener(
+  "click",
+  () => {
+
+    document
+      .getElementById("app")
+      .classList.remove(
+        "sidebar-collapsed"
+      );
+
+    openSidebarBtn.classList.add(
+      "hidden"
+    );
+
+  }
+);
 
 
 /* =========================================================
