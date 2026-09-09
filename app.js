@@ -46,7 +46,8 @@ let readerState = {
   settings: {
     theme: "sepia",
     fontSize: 20,
-    lineHeight: 1.9
+    lineHeight: 1.9,
+    contentWidth: 850
   },
 
   lastOpenedBookId: null,
@@ -139,6 +140,12 @@ const fontSizeValue =
 
 const lineHeightValue =
   document.getElementById("lineHeightValue");
+
+const contentWidthRange =
+  document.getElementById("contentWidthRange");
+
+const contentWidthValue =
+  document.getElementById("contentWidthValue");
 
 const settingsBtnMobile =
   document.getElementById("settingsBtnMobile");
@@ -1727,6 +1734,22 @@ lineHeightRange.addEventListener(
   }
 );
 
+contentWidthRange.addEventListener(
+  "input",
+  () => {
+
+    readerState.settings.contentWidth =
+      Number(
+        contentWidthRange.value
+      );
+
+    applySettings();
+
+    scheduleStateSave();
+
+  }
+);
+
 
 function applySettings() {
 
@@ -1738,6 +1761,7 @@ function applySettings() {
 
     "theme-light",
     "theme-sepia",
+    "theme-green",
     "theme-dark"
 
   );
@@ -1760,12 +1784,21 @@ function applySettings() {
     settings.lineHeight;
 
 
+  contentWidthRange.value =
+    settings.contentWidth || 850;
+
+
   fontSizeValue.textContent =
     `${settings.fontSize}px`;
 
 
   lineHeightValue.textContent =
     settings.lineHeight;
+
+
+  contentWidthValue.textContent =
+    `${settings.contentWidth || 850}px`;
+
 
 
   txtContent.style.fontSize =
@@ -1775,7 +1808,10 @@ function applySettings() {
   txtContent.style.lineHeight =
     settings.lineHeight;
 
+  txtContent.style.width =
+    `min(${readerState.settings.contentWidth || 850}px, 96%)`;
 
+   
   applyEpubSettings();
 
 }
@@ -1819,6 +1855,19 @@ function applyEpubSettings() {
 
     color =
       "#222222";
+
+  }
+
+  else if (
+    settings.theme ===
+    "green"
+  ) {
+
+    background =
+      "#cfe8cf";
+
+    color =
+      "#263a2b";
 
   }
 
@@ -1959,7 +2008,12 @@ async function loadState() {
         lineHeight:
           parsed.settings
             ?.lineHeight ||
-          1.9
+          1.9,
+
+        contentWidth:
+          parsed.settings
+            ?.contentWidth ||
+          850
 
       },
 
