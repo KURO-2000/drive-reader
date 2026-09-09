@@ -453,11 +453,101 @@ body.theme-sepia #sidebar {
 
 
 /* =========================
+   사이드바 접기 / 펼치기
+========================= */
+
+.sidebar-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+
+.sidebar-top .logo {
+  margin-bottom: 0;
+}
+
+
+.sidebar-toggle-btn {
+  width: 34px;
+  height: 34px;
+
+  flex-shrink: 0;
+
+  border: none;
+  border-radius: 8px;
+
+  background:
+    rgba(255,255,255,0.35);
+
+  color: inherit;
+
+  font-size: 16px;
+}
+
+
+.open-sidebar-btn {
+  position: absolute;
+
+  top: 12px;
+  left: 12px;
+
+  width: 40px;
+  height: 40px;
+
+  border: none;
+  border-radius: 9px;
+
+  background:
+    rgba(255,255,255,0.5);
+
+  color: inherit;
+
+  font-size: 20px;
+
+  z-index: 30;
+
+  box-shadow:
+    0 3px 12px
+    rgba(0,0,0,0.15);
+}
+
+
+#app.sidebar-collapsed #sidebar {
+  display: none;
+}
+
+
+#app.sidebar-collapsed #readerMain {
+  width: 100%;
+  flex: 1;
+}
+
+
+#app.sidebar-collapsed .open-sidebar-btn {
+  display: block !important;
+}
+
+
+body.theme-dark .sidebar-toggle-btn,
+body.theme-dark .open-sidebar-btn {
+  background:
+    rgba(255,255,255,0.08);
+}
+
+
+/* =========================
    모바일
 ========================= */
 
 @media (max-width: 800px) {
 
+  .sidebar-toggle-btn,
+  .open-sidebar-btn {
+    display: none !important;
+  }
+  
   #app {
     display: block;
   }
