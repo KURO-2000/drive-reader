@@ -453,6 +453,48 @@ body.theme-sepia #sidebar {
 
 
 /* =========================
+   GREEN
+========================= */
+
+body.theme-green {
+  background: #cfe8cf;
+  color: #263a2b;
+}
+
+
+body.theme-green #sidebar {
+  background: #bdd9bd;
+}
+
+
+body.theme-green .main-button,
+body.theme-green .upload-button,
+body.theme-green .reader-toolbar button,
+body.theme-green .sidebar-toggle-btn,
+body.theme-green .open-sidebar-btn {
+  background:
+    rgba(255,255,255,0.28);
+
+  border-color:
+    rgba(40,80,50,0.18);
+}
+
+
+body.theme-green .book-item:hover,
+body.theme-green .toc-item:hover {
+  background:
+    rgba(255,255,255,0.22);
+}
+
+
+body.theme-green .book-item.active,
+body.theme-green .toc-item.active {
+  background:
+    rgba(255,255,255,0.38);
+}
+
+
+/* =========================
    사이드바 접기 / 펼치기
 ========================= */
 
