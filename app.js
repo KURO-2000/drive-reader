@@ -143,6 +143,9 @@ const lineHeightValue =
 const settingsBtnMobile =
   document.getElementById("settingsBtnMobile");
 
+const settingsBtnDesktop =
+  document.getElementById("settingsBtnDesktop");
+
 const closeSettingsBtn =
   document.getElementById("closeSettingsBtn");
 
@@ -2082,6 +2085,12 @@ async function saveState() {
 ========================================================= */
 
 settingsBtnMobile.addEventListener(
+  "click",
+  openSettings
+);
+
+
+settingsBtnDesktop.addEventListener(
   "click",
   openSettings
 );
