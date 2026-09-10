@@ -19,12 +19,6 @@ const STATE_FILE_NAME =
 const GOOGLE_CONNECTED_KEY =
   "driveReaderGoogleConnected";
 
-const GOOGLE_ACCESS_TOKEN_KEY =
-  "driveReaderGoogleAccessToken";
-
-const GOOGLE_ACCESS_TOKEN_EXPIRES_KEY =
-  "driveReaderGoogleAccessTokenExpires";
-
 
 /* =========================================================
    상태
@@ -190,8 +184,6 @@ const mobileBookTitle =
 
 window.addEventListener("load", () => {
 
-  restoreStoredAccessToken();
-
   applySettings();
 
   waitForGoogle();
@@ -246,99 +238,6 @@ function initGoogle() {
     autoReconnectGoogleDrive();
 
   }
-
-}
-
-
-function saveAccessTokenResponse(response) {
-
-  if (
-    !response ||
-    !response.access_token
-  ) {
-
-    return;
-
-  }
-
-
-  accessToken =
-    response.access_token;
-
-
-  const expiresIn =
-    Number(
-      response.expires_in || 3600
-    );
-
-
-  const expiresAt =
-    Date.now() +
-    expiresIn * 1000;
-
-
-  localStorage.setItem(
-    GOOGLE_ACCESS_TOKEN_KEY,
-    accessToken
-  );
-
-
-  localStorage.setItem(
-    GOOGLE_ACCESS_TOKEN_EXPIRES_KEY,
-    String(expiresAt)
-  );
-
-}
-
-
-function restoreStoredAccessToken() {
-
-  const storedToken =
-    localStorage.getItem(
-      GOOGLE_ACCESS_TOKEN_KEY
-    );
-
-
-  const storedExpiresAt =
-    Number(
-      localStorage.getItem(
-        GOOGLE_ACCESS_TOKEN_EXPIRES_KEY
-      ) || 0
-    );
-
-
-  if (
-    storedToken &&
-    storedExpiresAt >
-      Date.now() + 30000
-  ) {
-
-    accessToken =
-      storedToken;
-
-    return true;
-
-  }
-
-
-  clearStoredAccessToken();
-
-  return false;
-
-}
-
-
-function clearStoredAccessToken() {
-
-  accessToken = "";
-
-  localStorage.removeItem(
-    GOOGLE_ACCESS_TOKEN_KEY
-  );
-
-  localStorage.removeItem(
-    GOOGLE_ACCESS_TOKEN_EXPIRES_KEY
-  );
 
 }
 
@@ -433,11 +332,7 @@ async function autoReconnectGoogleDrive() {
       "Google Drive 자동 연결 중...";
 
 
-    if (!accessToken) {
-
-      await authorizeSilently();
-
-    }
+    await authorizeSilently();
 
 
     libraryFolderId =
@@ -490,7 +385,7 @@ async function autoReconnectGoogleDrive() {
     );
 
 
-    clearStoredAccessToken();
+    accessToken = "";
 
 
     loginStatus.textContent =
@@ -538,9 +433,8 @@ function authorizeSilently() {
           }
 
 
-          saveAccessTokenResponse(
-            response
-          );
+          accessToken =
+            response.access_token;
 
 
           resolve(
@@ -594,9 +488,8 @@ function authorize() {
 
           }
 
-          saveAccessTokenResponse(
-            response
-          );
+          accessToken =
+            response.access_token;
 
           resolve(
             accessToken
@@ -608,9 +501,7 @@ function authorize() {
       tokenClient.requestAccessToken({
 
         prompt:
-          localStorage.getItem(
-            GOOGLE_CONNECTED_KEY
-          ) === "1"
+          accessToken
             ? ""
             : "consent"
 
@@ -633,21 +524,7 @@ async function apiFetch(
 
   if (!accessToken) {
 
-    try {
-
-      await authorizeSilently();
-
-    }
-
-    catch (error) {
-
-      clearStoredAccessToken();
-
-      throw new Error(
-        "Google Drive 재연결이 필요합니다."
-      );
-
-    }
+    await authorize();
 
   }
 
@@ -679,22 +556,7 @@ async function apiFetch(
     response.status === 401
   ) {
 
-    clearStoredAccessToken();
-
-
-    try {
-
-      await authorizeSilently();
-
-    }
-
-    catch (error) {
-
-      throw new Error(
-        "Google Drive 로그인 시간이 만료되었습니다. 연결 버튼을 다시 눌러주세요."
-      );
-
-    }
+    await authorize();
 
 
     response =
@@ -2521,7 +2383,7 @@ function createDisguiseOverlay() {
 }
 
 
-async function setDisguiseMode(
+function setDisguiseMode(
   enabled
 ) {
 
@@ -2543,31 +2405,6 @@ async function setDisguiseMode(
     document.body.style.cursor =
       "none";
 
-
-    try {
-
-      if (
-        !document.fullscreenElement &&
-        document.documentElement
-          .requestFullscreen
-      ) {
-
-        await document.documentElement
-          .requestFullscreen();
-
-      }
-
-    }
-
-    catch (error) {
-
-      console.log(
-        "전체화면 전환 실패",
-        error
-      );
-
-    }
-
   }
 
   else {
@@ -2580,30 +2417,6 @@ async function setDisguiseMode(
 
     document.body.style.cursor =
       "";
-
-
-    try {
-
-      if (
-        document.fullscreenElement &&
-        document.exitFullscreen
-      ) {
-
-        await document
-          .exitFullscreen();
-
-      }
-
-    }
-
-    catch (error) {
-
-      console.log(
-        "전체화면 해제 실패",
-        error
-      );
-
-    }
 
   }
 
