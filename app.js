@@ -16,6 +16,9 @@ const LIBRARY_FOLDER_NAME =
 const STATE_FILE_NAME =
   "reader-state.json";
 
+const GOOGLE_CONNECTED_KEY =
+  "driveReaderGoogleConnected";
+
 
 /* =========================================================
    상태
@@ -225,6 +228,17 @@ function initGoogle() {
 
     });
 
+
+  if (
+    localStorage.getItem(
+      GOOGLE_CONNECTED_KEY
+    ) === "1"
+  ) {
+
+    autoReconnectGoogleDrive();
+
+  }
+
 }
 
 
@@ -266,6 +280,12 @@ async function connectGoogleDrive() {
       "✓ Google Drive 연결됨";
 
 
+    localStorage.setItem(
+      GOOGLE_CONNECTED_KEY,
+      "1"
+    );
+
+
     if (
       readerState.lastOpenedBookId
     ) {
@@ -300,6 +320,138 @@ async function connectGoogleDrive() {
     );
 
   }
+
+}
+
+
+async function autoReconnectGoogleDrive() {
+
+  try {
+
+    loginStatus.textContent =
+      "Google Drive 자동 연결 중...";
+
+
+    await authorizeSilently();
+
+
+    libraryFolderId =
+      await ensureLibraryFolder();
+
+
+    await loadState();
+
+
+    applySettings();
+
+
+    await loadBooks();
+
+
+    loginStatus.textContent =
+      "Google Drive 연결됨";
+
+    googleLoginBtn.textContent =
+      "✓ Google Drive 연결됨";
+
+
+    if (
+      readerState.lastOpenedBookId
+    ) {
+
+      const book =
+        books.find(
+          b =>
+            b.id ===
+            readerState.lastOpenedBookId
+        );
+
+
+      if (book) {
+
+        await openBook(book);
+
+      }
+
+    }
+
+  }
+
+  catch (error) {
+
+    console.log(
+      "Google Drive 자동 연결 실패",
+      error
+    );
+
+
+    accessToken = "";
+
+
+    loginStatus.textContent =
+      "Google Drive 연결 필요";
+
+    googleLoginBtn.textContent =
+      "Google Drive 연결";
+
+  }
+
+}
+
+
+function authorizeSilently() {
+
+  return new Promise(
+    (resolve, reject) => {
+
+      if (!tokenClient) {
+
+        reject(
+          new Error(
+            "Google 인증 준비가 끝나지 않았습니다."
+          )
+        );
+
+        return;
+
+      }
+
+
+      tokenClient.callback =
+        response => {
+
+          if (response.error) {
+
+            reject(
+              new Error(
+                response.error
+              )
+            );
+
+            return;
+
+          }
+
+
+          accessToken =
+            response.access_token;
+
+
+          resolve(
+            accessToken
+          );
+
+        };
+
+
+      tokenClient.requestAccessToken({
+
+        prompt: ""
+
+      });
+
+    }
+  );
 
 }
 
@@ -2178,6 +2330,122 @@ function closeSettings() {
   );
 
 }
+
+
+/* =========================================================
+   Ctrl + G 위장 모드
+========================================================= */
+
+const ORIGINAL_DOCUMENT_TITLE =
+  document.title;
+
+let disguiseMode = false;
+let disguiseOverlay = null;
+
+
+function createDisguiseOverlay() {
+
+  if (disguiseOverlay) {
+    return;
+  }
+
+
+  disguiseOverlay =
+    document.createElement(
+      "div"
+    );
+
+
+  disguiseOverlay.id =
+    "disguiseOverlay";
+
+
+  Object.assign(
+    disguiseOverlay.style,
+    {
+      position: "fixed",
+      inset: "0",
+      width: "100vw",
+      height: "100vh",
+      background: "#000000",
+      zIndex: "2147483647",
+      display: "none",
+      margin: "0",
+      padding: "0"
+    }
+  );
+
+
+  document.body.appendChild(
+    disguiseOverlay
+  );
+
+}
+
+
+function setDisguiseMode(
+  enabled
+) {
+
+  createDisguiseOverlay();
+
+
+  disguiseMode =
+    enabled;
+
+
+  if (disguiseMode) {
+
+    disguiseOverlay.style.display =
+      "block";
+
+    document.title =
+      "\u200B";
+
+    document.body.style.cursor =
+      "none";
+
+  }
+
+  else {
+
+    disguiseOverlay.style.display =
+      "none";
+
+    document.title =
+      ORIGINAL_DOCUMENT_TITLE;
+
+    document.body.style.cursor =
+      "";
+
+  }
+
+}
+
+
+document.addEventListener(
+  "keydown",
+  event => {
+
+    if (
+      event.ctrlKey &&
+      !event.altKey &&
+      !event.metaKey &&
+      event.key.toLowerCase() === "g"
+    ) {
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      setDisguiseMode(
+        !disguiseMode
+      );
+
+    }
+
+  },
+  true
+);
 
 
 /* =========================================================
