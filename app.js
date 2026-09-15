@@ -50,6 +50,11 @@ let epubObjectUrl = null;
 let scrollSaveTimer = null;
 let stateSaveTimer = null;
 
+const AUTO_DISGUISE_DELAY_MS =
+  10 * 60 * 1000;
+
+let autoDisguiseTimer = null;
+
 let readerState = {
 
   settings: {
@@ -1188,6 +1193,9 @@ async function openBook(book) {
 
   closeMobileMenu();
 
+
+  resetAutoDisguiseTimer();
+
 }
 
 
@@ -1567,8 +1575,22 @@ async function moveTxtChapter(
   }
 
 
+  const previousTxtChapter =
+    currentTxtChapter;
+
+
   currentTxtChapter =
     index;
+
+
+  if (
+    currentTxtChapter >
+    previousTxtChapter
+  ) {
+
+    resetAutoDisguiseTimer();
+
+  }
 
 
   readerState
@@ -1909,6 +1931,8 @@ epubPrevBtn.addEventListener(
 epubNextBtn.addEventListener(
   "click",
   () => {
+
+    resetAutoDisguiseTimer();
 
     epubRendition
       ?.next();
@@ -2561,6 +2585,58 @@ function setDisguiseMode(
 }
 
 
+function clearAutoDisguiseTimer() {
+
+  if (autoDisguiseTimer) {
+
+    clearTimeout(
+      autoDisguiseTimer
+    );
+
+    autoDisguiseTimer = null;
+
+  }
+
+}
+
+
+function resetAutoDisguiseTimer() {
+
+  clearAutoDisguiseTimer();
+
+
+  if (
+    !selectedBook ||
+    disguiseMode
+  ) {
+
+    return;
+
+  }
+
+
+  autoDisguiseTimer =
+    setTimeout(
+      () => {
+
+        autoDisguiseTimer = null;
+
+        if (
+          selectedBook &&
+          !disguiseMode
+        ) {
+
+          setDisguiseMode(true);
+
+        }
+
+      },
+      AUTO_DISGUISE_DELAY_MS
+    );
+
+}
+
+
 document.addEventListener(
   "keydown",
   event => {
@@ -2575,9 +2651,26 @@ document.addEventListener(
       event.preventDefault();
       event.stopPropagation();
 
+      const willHide =
+        !disguiseMode;
+
+
       setDisguiseMode(
-        !disguiseMode
+        willHide
       );
+
+
+      if (willHide) {
+
+        clearAutoDisguiseTimer();
+
+      }
+
+      else {
+
+        resetAutoDisguiseTimer();
+
+      }
 
     }
 
