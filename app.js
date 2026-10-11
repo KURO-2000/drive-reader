@@ -1199,6 +1199,9 @@ async function openBook(book) {
   scheduleStateSave();
 
 
+  prepareMobilePagedBook();
+
+
   emptyScreen.classList.add(
     "hidden"
   );
@@ -1233,6 +1236,14 @@ async function openBook(book) {
 
   closeMobileMenu();
 
+
+  setMobileReadingControlsVisible(false);
+
+  if (isMobilePagedReading() && isMobileTxtBook()) {
+    requestAnimationFrame(() =>
+      finishMobileTxtRender(readerState.txtProgress[book.id]?.pageRatio ??
+        readerState.txtProgress[book.id]?.scrollRatio ?? 0));
+  }
 
   resetAutoDisguiseTimer();
 
@@ -1284,6 +1295,8 @@ async function openTxtBook(book) {
       text
     );
 
+  buildMobileTxtLengthIndex();
+
 
   const progress =
     readerState
@@ -1303,7 +1316,9 @@ async function openTxtBook(book) {
 
 
   renderTxtChapter(
-    progress.scrollRatio || 0
+    isMobilePagedReading() ?
+      (progress.pageRatio ?? progress.scrollRatio ?? 0) :
+      (progress.scrollRatio || 0)
   );
 
 
@@ -1514,10 +1529,12 @@ function renderTxtChapter(
             txtScrollArea.clientHeight;
 
 
-          txtScrollArea.scrollTop =
-            max > 0
-              ? max * restoreRatio
-              : 0;
+          if (isMobilePagedReading()) {
+            finishMobileTxtRender(restoreRatio);
+          } else {
+            txtScrollArea.scrollTop = max > 0 ?
+              max * restoreRatio : 0;
+          }
 
         }
       );
@@ -1601,7 +1618,8 @@ function renderTxtToc() {
 ========================================================= */
 
 async function moveTxtChapter(
-  index
+  index,
+  restoreRatio = 0
 ) {
 
   if (
@@ -1641,12 +1659,13 @@ async function moveTxtChapter(
       chapterIndex:
         currentTxtChapter,
 
-      scrollRatio: 0
+      scrollRatio: restoreRatio,
+      pageRatio: restoreRatio
 
     };
 
 
-  renderTxtChapter(0);
+  renderTxtChapter(restoreRatio);
 
 
   scheduleStateSave();
@@ -1714,6 +1733,11 @@ txtScrollArea.addEventListener(
 
 
 function saveTxtScroll() {
+
+  if (isMobilePagedReading() && isMobileTxtBook()) {
+    rememberMobileTxtProgress();
+    return;
+  }
 
   const max =
     txtScrollArea.scrollHeight -
@@ -1796,12 +1820,27 @@ async function openEpubBook(
 
         height: "100%",
 
-        flow:
-          "scrolled-doc"
+        flow: isMobilePagedReading() ?
+          "paginated" : "scrolled-doc"
 
       }
 
     );
+
+
+  // EPUB 본문은 iframe 안에 있기 때문에 별도로 터치 이벤트를 연결합니다.
+  // 리더가 내부 페이지를 다시 렌더링해도 자동으로 적용됩니다.
+  epubRendition.hooks.content.register(
+    contents => {
+
+      if (contents && contents.document) {
+
+        bindMobilePageGestures(contents.document, contents.document);
+
+      }
+
+    }
+  );
 
 
   const progress =
@@ -1811,9 +1850,16 @@ async function openEpubBook(
       ] || {};
 
 
+  epubRendition.on("relocated", location => {
+    mobilePageState.epubLocation = location;
+    updateMobileProgressDisplay();
+  });
+
   await epubRendition.display(
     progress.cfi || undefined
   );
+
+  startMobileEpubLocations(epubBook);
 
 
   epubTitle.textContent =
@@ -1846,6 +1892,7 @@ async function openEpubBook(
 
 
       scheduleStateSave();
+      updateMobileProgressDisplay();
 
     }
 
@@ -2167,6 +2214,12 @@ function applySettings() {
 
    
   applyEpubSettings();
+
+  if (isMobilePagedReading() && isMobileTxtBook()) {
+    const ratio = mobilePageState.txtPages <= 1 ? 0 :
+      mobilePageState.txtPageIndex / (mobilePageState.txtPages - 1);
+    requestAnimationFrame(() => finishMobileTxtRender(ratio));
+  }
 
 }
 
@@ -2853,6 +2906,521 @@ window.addEventListener(
 
   }
 );
+/* =========================================================
+   휴대폰 페이지형 독서 모드 (TXT / EPUB)
+   - PC는 기존 세로 스크롤 방식 유지
+   - 좌우 탭/스와이프: 페이지 이동
+   - 가운데 터치: 읽기 메뉴 표시/숨김
+   - 진행바: 책 전체 위치 이동
+   - 하단 이전 장 / 다음 장: 페이지가 아닌 장 이동
+========================================================= */
+
+const mobilePageState = {
+  controls: null,
+  slider: null,
+  progressLabel: null,
+  subtitle: null,
+  controlsVisible: false,
+  txtPages: 1,
+  txtPageIndex: 0,
+  chapterPrefix: [0],
+  totalChars: 1,
+  epubLocationsReady: false,
+  epubLocationBook: null,
+  epubLocation: null,
+  sliderDragging: false,
+  resizeTimer: null
+};
+
+function isMobileReadingLayout() {
+  return window.matchMedia('(max-width: 800px)').matches;
+}
+
+function isMobileTxtBook() {
+  return !!selectedBook &&
+    selectedBook.name.toLowerCase().endsWith('.txt');
+}
+
+function isMobilePagedReading() {
+  return isMobileReadingLayout() &&
+    !!selectedBook &&
+    document.body.classList.contains('mobile-paged-reading');
+}
+
+function isReadingControlTarget(target) {
+  const elem = target?.nodeType === 1
+    ? target : target?.parentElement;
+  return !!elem?.closest?.(
+    'a, button, input, select, textarea, summary, [contenteditable="true"]'
+  );
+}
+
+function initializeMobilePagedReading() {
+  if (document.getElementById('mobilePagedReaderStyle')) return;
+
+  const style = document.createElement('style');
+  style.id = 'mobilePagedReaderStyle';
+  style.textContent = `
+    @media (max-width:800px) {
+      body.mobile-paged-reading { overflow:hidden !important; }
+      body.mobile-paged-reading .mobile-header,
+      body.mobile-paged-reading #txtReader .reader-toolbar,
+      body.mobile-paged-reading #epubReader .reader-toolbar,
+      body.mobile-paged-reading .open-sidebar-btn { display:none !important; }
+      body.mobile-paged-reading #app { height:100dvh !important; }
+      body.mobile-paged-reading #readerMain {
+        height:100dvh !important;
+        width:100% !important;
+      }
+      body.mobile-paged-reading #txtReader,
+      body.mobile-paged-reading #epubReader { height:100% !important; }
+      body.mobile-paged-reading #txtScrollArea {
+        height:100% !important;
+        overflow-x:auto !important;
+        overflow-y:hidden !important;
+        scroll-behavior:auto !important;
+        scrollbar-width:none !important;
+        touch-action:none !important;
+        overscroll-behavior:contain;
+      }
+      body.mobile-paged-reading #txtScrollArea::-webkit-scrollbar { display:none !important; }
+      body.mobile-paged-reading #txtContent {
+        box-sizing:border-box !important;
+        margin:0 16px !important;
+        width:calc(100vw - 32px) !important;
+        min-width:calc(100vw - 32px) !important;
+        height:100% !important;
+        max-height:100% !important;
+        padding:22px 0 36px !important;
+        column-width:calc(100vw - 32px) !important;
+        column-gap:32px !important;
+        column-fill:auto !important;
+        white-space:pre-wrap !important;
+        overflow-wrap:anywhere !important;
+      }
+      body.mobile-paged-reading #epubViewer {
+        min-height:0 !important;
+        height:100% !important;
+        touch-action:none !important;
+      }
+      #mobileReaderUi {
+        display:none;
+        position:fixed;
+        inset:0;
+        z-index:2000;
+        pointer-events:none;
+        font-family:Arial, 'Noto Sans KR', 'Noto Sans SC', sans-serif;
+      }
+      body.mobile-paged-reading #mobileReaderUi { display:block; }
+      #mobileReaderUi .mobile-reader-top,
+      #mobileReaderUi .mobile-reader-bottom {
+        position:absolute;
+        left:0; right:0;
+        background:var(--mobile-menu-bg,#efe0c3);
+        color:var(--mobile-menu-fg,#332c27);
+        box-shadow:0 2px 15px rgba(0,0,0,.16);
+        pointer-events:auto;
+        transition:transform .16s ease, opacity .16s ease;
+      }
+      #mobileReaderUi .mobile-reader-top {
+        top:0;
+        padding:calc(env(safe-area-inset-top, 0px) + 8px) 12px 10px;
+        display:flex;
+        align-items:center;
+        gap:10px;
+        min-height:58px;
+      }
+      #mobileReaderUi .mobile-reader-top-title {
+        flex:1;
+        min-width:0;
+        white-space:nowrap;
+        text-overflow:ellipsis;
+        overflow:hidden;
+        text-align:center;
+        font-size:15px;
+      }
+      #mobileReaderUi .mobile-reader-bottom {
+        bottom:0;
+        padding:14px 12px calc(env(safe-area-inset-bottom, 0px) + 16px);
+        display:flex;
+        flex-direction:column;
+        gap:12px;
+      }
+      body.mobile-paged-reading:not(.mobile-paged-controls-visible) #mobileReaderUi .mobile-reader-top {
+        transform:translateY(-110%);
+        opacity:0;
+        pointer-events:none;
+      }
+      body.mobile-paged-reading:not(.mobile-paged-controls-visible) #mobileReaderUi .mobile-reader-bottom {
+        transform:translateY(110%);
+        opacity:0;
+        pointer-events:none;
+      }
+      #mobileReaderUi button {
+        border:0; border-radius:8px;
+        background:rgba(255,255,255,.24);
+        color:inherit;
+        padding:9px 12px;
+        font-size:14px;
+        cursor:pointer;
+        touch-action:manipulation;
+      }
+      #mobileReaderUi button:disabled { opacity:.4; }
+      #mobileReaderUi .mobile-reader-progress-text {
+        text-align:center;
+        font-size:13px;
+        opacity:.9;
+        font-variant-numeric:tabular-nums;
+      }
+      #mobileReaderUi .mobile-reader-progress-row { display:flex; align-items:center; gap:10px; }
+      #mobileReaderUi .mobile-reader-progress-row input {
+        min-width:0; flex:1; width:100%;
+        accent-color:#a35448;
+        touch-action:pan-x;
+      }
+      #mobileReaderUi .mobile-reader-chapter-row { display:flex; gap:10px; }
+      #mobileReaderUi .mobile-reader-chapter-row button { flex:1; }
+      #mobileReaderUi .mobile-reader-actions { display:flex; gap:8px; justify-content:space-around; }
+      #mobileReaderUi .mobile-reader-actions button { flex:1; }
+      body.theme-dark #mobileReaderUi { --mobile-menu-bg:#252525; --mobile-menu-fg:#ededed; }
+      body.theme-light #mobileReaderUi { --mobile-menu-bg:#f3f3f3; --mobile-menu-fg:#222; }
+      body.theme-green #mobileReaderUi { --mobile-menu-bg:#bdd9bd; --mobile-menu-fg:#263a2b; }
+      body.theme-sepia #mobileReaderUi { --mobile-menu-bg:#efe0c3; --mobile-menu-fg:#3f3125; }
+    }
+  `;
+  document.head.appendChild(style);
+
+  const ui = document.createElement('div');
+  ui.id = 'mobileReaderUi';
+  ui.setAttribute('aria-label', '휴대폰 독서 메뉴');
+  ui.innerHTML = `
+    <div class="mobile-reader-top">
+      <button id="mReaderLibraryBtn" type="button" aria-label="내 서재">☰</button>
+      <div class="mobile-reader-top-title" id="mReaderTitle"></div>
+      <button id="mReaderCloseBtn" type="button" aria-label="메뉴 닫기">✕</button>
+    </div>
+    <div class="mobile-reader-bottom">
+      <div class="mobile-reader-progress-text" id="mReaderProgressText">위치 불러오는 중...</div>
+      <div class="mobile-reader-progress-row">
+        <input id="mReaderProgressSlider" type="range" min="0" max="1000" step="1" value="0" aria-label="책 전체 읽기 위치 이동" />
+        <span id="mReaderPercent">0%</span>
+      </div>
+      <div class="mobile-reader-chapter-row">
+        <button id="mReaderPrevChapter" type="button">← 이전 장</button>
+        <button id="mReaderNextChapter" type="button">다음 장 →</button>
+      </div>
+      <div class="mobile-reader-actions">
+        <button id="mReaderToc" type="button">☷ 목차</button>
+        <button id="mReaderFont" type="button">Aa 글자</button>
+        <button id="mReaderSettings" type="button">⚙ 설정</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(ui);
+  mobilePageState.controls = ui;
+  mobilePageState.slider = ui.querySelector('#mReaderProgressSlider');
+  mobilePageState.progressLabel = ui.querySelector('#mReaderProgressText');
+  mobilePageState.subtitle = ui.querySelector('#mReaderPercent');
+
+  ui.querySelector('#mReaderLibraryBtn').addEventListener('click', () => {
+    setMobileReadingControlsVisible(false);
+    sidebar.classList.add('open');
+    overlay.classList.remove('hidden');
+  });
+  ui.querySelector('#mReaderCloseBtn').addEventListener('click', () =>
+    setMobileReadingControlsVisible(false));
+  ui.querySelector('#mReaderToc').addEventListener('click', () => {
+    setMobileReadingControlsVisible(false);
+    sidebar.classList.add('open');
+    overlay.classList.remove('hidden');
+    tocSection.scrollIntoView({block:'start'});
+  });
+  ui.querySelector('#mReaderFont').addEventListener('click', () => {
+    setMobileReadingControlsVisible(false);
+    openSettings();
+    fontSizeRange.focus({preventScroll:true});
+  });
+  ui.querySelector('#mReaderSettings').addEventListener('click', () => {
+    setMobileReadingControlsVisible(false);
+    openSettings();
+  });
+  ui.querySelector('#mReaderPrevChapter').addEventListener('click', () => moveMobileChapter(-1));
+  ui.querySelector('#mReaderNextChapter').addEventListener('click', () => moveMobileChapter(1));
+
+  mobilePageState.slider.addEventListener('pointerdown', () => {
+    mobilePageState.sliderDragging = true;
+  });
+  mobilePageState.slider.addEventListener('pointerup', () => {
+    mobilePageState.sliderDragging = false;
+  });
+  mobilePageState.slider.addEventListener('pointercancel', () => {
+    mobilePageState.sliderDragging = false;
+  });
+  mobilePageState.slider.addEventListener('change', () => {
+    mobilePageState.sliderDragging = false;
+    seekMobileBookProgress(Number(mobilePageState.slider.value) / 1000);
+  });
+
+  bindMobilePageGestures(txtScrollArea, document);
+  window.addEventListener('resize', () => {
+    if (!isMobilePagedReading()) return;
+    clearTimeout(mobilePageState.resizeTimer);
+    mobilePageState.resizeTimer = setTimeout(() => {
+      if (isMobileTxtBook()) {
+        renderTxtChapter(mobilePageState.txtPages <= 1 ? 0 :
+          mobilePageState.txtPageIndex / (mobilePageState.txtPages - 1));
+      } else {
+        epubRendition?.resize();
+        updateMobileProgressDisplay();
+      }
+    }, 180);
+  });
+}
+
+function prepareMobilePagedBook() {
+  initializeMobilePagedReading();
+  document.body.classList.toggle('mobile-paged-reading', isMobileReadingLayout());
+  setMobileReadingControlsVisible(false);
+  mobilePageState.epubLocationsReady = false;
+  mobilePageState.epubLocationBook = null;
+  mobilePageState.epubLocation = null;
+}
+
+function setMobileReadingControlsVisible(visible) {
+  mobilePageState.controlsVisible = !!visible;
+  document.body.classList.toggle('mobile-paged-controls-visible',
+    !!visible && isMobilePagedReading());
+  if (visible) updateMobileProgressDisplay();
+}
+
+function toggleMobileReadingControls() {
+  if (!isMobilePagedReading() || disguiseMode) return;
+  setMobileReadingControlsVisible(!mobilePageState.controlsVisible);
+}
+
+function getMobileTxtPageStride() {
+  return Math.max(1, txtScrollArea.clientWidth);
+}
+
+function getMobileTxtPageCount() {
+  const stride = getMobileTxtPageStride();
+  const scrollWidth = Math.max(txtScrollArea.scrollWidth, txtContent.scrollWidth);
+  const max = Math.max(0, scrollWidth - txtScrollArea.clientWidth);
+  return Math.max(1, Math.round(max / stride) + 1);
+}
+
+function finishMobileTxtRender(ratio = 0) {
+  if (!isMobilePagedReading() || !isMobileTxtBook()) return;
+  const pageCount = getMobileTxtPageCount();
+  mobilePageState.txtPages = pageCount;
+  mobilePageState.txtPageIndex = Math.min(pageCount - 1,
+    Math.max(0, Math.round(ratio * (pageCount - 1))));
+  txtScrollArea.scrollLeft = mobilePageState.txtPageIndex * getMobileTxtPageStride();
+  txtScrollArea.scrollTop = 0;
+  updateMobileProgressDisplay();
+}
+
+function rememberMobileTxtProgress() {
+  if (!isMobilePagedReading() || !isMobileTxtBook()) return;
+  const ratio = mobilePageState.txtPages <= 1 ? 0 :
+    mobilePageState.txtPageIndex / (mobilePageState.txtPages - 1);
+  readerState.txtProgress[selectedBook.id] = {
+    chapterIndex:currentTxtChapter,
+    scrollRatio:ratio,
+    pageRatio:ratio
+  };
+  scheduleStateSave();
+}
+
+function buildMobileTxtLengthIndex() {
+  let total = 0;
+  mobilePageState.chapterPrefix = [0];
+  for (const chapter of txtChapters) {
+    total += Math.max(1, chapter.content.length);
+    mobilePageState.chapterPrefix.push(total);
+  }
+  mobilePageState.totalChars = Math.max(1, total);
+}
+
+function getMobileBookPercent() {
+  if (isMobileTxtBook()) {
+    const start = mobilePageState.chapterPrefix[currentTxtChapter] || 0;
+    const len = Math.max(1, txtChapters[currentTxtChapter]?.content?.length || 1);
+    const r = mobilePageState.txtPages <= 1 ? 0 :
+      mobilePageState.txtPageIndex / (mobilePageState.txtPages - 1);
+    return Math.min(1, (start + r * len) / mobilePageState.totalChars);
+  }
+  const loc = mobilePageState.epubLocation;
+  const cfi = loc?.start?.cfi;
+  if (mobilePageState.epubLocationsReady && cfi) {
+    const p = mobilePageState.epubLocationBook?.locations?.percentageFromCfi(cfi);
+    if (Number.isFinite(p)) return Math.min(1, Math.max(0, p));
+  }
+  const spineLen = epubBook?.spine?.length || epubBook?.spine?.items?.length || 1;
+  const spineIndex = loc?.start?.index || 0;
+  const local = loc?.start?.displayed;
+  const localP = local?.total ? (Math.max(0, local.page - 1) / local.total) : 0;
+  return Math.max(0, Math.min(1, (spineIndex + localP) / spineLen));
+}
+
+function updateMobileProgressDisplay() {
+  if (!isMobilePagedReading() || !mobilePageState.controls) return;
+  const percent = getMobileBookPercent();
+  if (!mobilePageState.sliderDragging) {
+    mobilePageState.slider.value = String(Math.round(percent * 1000));
+  }
+  mobilePageState.subtitle.textContent = `${Math.round(percent * 100)}%`;
+  mobilePageState.controls.querySelector('#mReaderTitle').textContent = selectedBook?.name || '';
+  let label;
+  if (isMobileTxtBook()) {
+    label = `${currentTxtChapter + 1}/${txtChapters.length}장 · ` +
+      `${mobilePageState.txtPageIndex + 1}/${mobilePageState.txtPages}페이지 · 전체 ${Math.round(percent*100)}%`;
+  } else {
+    const loc = mobilePageState.epubLocation?.start?.displayed;
+    const pageText = loc?.total ? `${loc.page}/${loc.total}페이지` : '페이지 확인 중';
+    label = `${pageText} · 전체 ${Math.round(percent * 100)}%`;
+  }
+  mobilePageState.progressLabel.textContent = label;
+  const prev = mobilePageState.controls.querySelector('#mReaderPrevChapter');
+  const next = mobilePageState.controls.querySelector('#mReaderNextChapter');
+  if (isMobileTxtBook()) {
+    prev.disabled = currentTxtChapter <= 0;
+    next.disabled = currentTxtChapter >= txtChapters.length - 1;
+  } else {
+    const current = epubBook?.spine?.get(mobilePageState.epubLocation?.start?.cfi);
+    prev.disabled = !current?.prev();
+    next.disabled = !current?.next();
+  }
+}
+
+function turnMobileTxtPage(direction) {
+  if (!isMobilePagedReading() || !isMobileTxtBook()) return;
+  if (direction > 0 && mobilePageState.txtPageIndex >= mobilePageState.txtPages - 1) {
+    moveTxtChapter(currentTxtChapter + 1);
+    return;
+  }
+  if (direction < 0 && mobilePageState.txtPageIndex <= 0) {
+    if (currentTxtChapter > 0) moveTxtChapter(currentTxtChapter - 1, 1);
+    return;
+  }
+  mobilePageState.txtPageIndex = Math.max(0,
+    Math.min(mobilePageState.txtPages - 1, mobilePageState.txtPageIndex + direction));
+  txtScrollArea.scrollLeft = mobilePageState.txtPageIndex * getMobileTxtPageStride();
+  rememberMobileTxtProgress();
+  updateMobileProgressDisplay();
+}
+
+function turnMobilePage(direction) {
+  if (!isMobilePagedReading()) return;
+  if (isMobileTxtBook()) {
+    turnMobileTxtPage(direction);
+  } else {
+    if (direction > 0) epubRendition?.next();
+    else epubRendition?.prev();
+  }
+}
+
+function moveMobileChapter(direction) {
+  if (!isMobilePagedReading()) return;
+  if (isMobileTxtBook()) {
+    moveTxtChapter(currentTxtChapter + direction);
+    return;
+  }
+  const current = epubBook?.spine?.get(mobilePageState.epubLocation?.start?.cfi);
+  const dest = direction > 0 ? current?.next() : current?.prev();
+  if (dest) {
+    epubRendition?.display(dest.href || dest.idref);
+  }
+}
+
+async function seekMobileBookProgress(p) {
+  if (!isMobilePagedReading()) return;
+  const target = Math.max(0, Math.min(0.999999, p));
+  if (isMobileTxtBook()) {
+    const chars = target * mobilePageState.totalChars;
+    let low = 0;
+    let high = txtChapters.length - 1;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (mobilePageState.chapterPrefix[mid + 1] <= chars) low = mid + 1;
+      else high = mid;
+    }
+    const length = Math.max(1, txtChapters[low]?.content?.length || 1);
+    const within = Math.max(0, Math.min(1,
+      (chars - mobilePageState.chapterPrefix[low]) / length));
+    if (low !== currentTxtChapter) moveTxtChapter(low, within);
+    else {
+      finishMobileTxtRender(within);
+      rememberMobileTxtProgress();
+    }
+  } else {
+    try {
+      const locations = epubBook?.locations;
+      if (!mobilePageState.epubLocationsReady || !locations) {
+        mobilePageState.progressLabel.textContent = 'EPUB 위치 계산 중... 잠시 후 다시 시도하세요';
+        return;
+      }
+      const cfi = locations.cfiFromPercentage(target);
+      if (cfi) await epubRendition?.display(cfi);
+    } catch (error) {
+      console.warn('EPUB 이동 실패', error);
+    }
+  }
+  updateMobileProgressDisplay();
+}
+
+function bindMobilePageGestures(target, ownerDocument) {
+  if (!target || target.__mobilePageGesturesBound) return;
+  target.__mobilePageGesturesBound = true;
+  let start = null;
+  target.addEventListener('pointerdown', event => {
+    if (!isMobilePagedReading() || !event.isPrimary || event.button !== 0 ||
+        isReadingControlTarget(event.target)) {
+      start = null; return;
+    }
+    start = { id:event.pointerId, x:event.clientX, y:event.clientY, t:Date.now() };
+  }, {passive:true});
+  target.addEventListener('pointercancel', () => { start = null; }, {passive:true});
+  target.addEventListener('pointerup', event => {
+    if (!start || start.id !== event.pointerId || !isMobilePagedReading()) return;
+    const dx = event.clientX - start.x;
+    const dy = event.clientY - start.y;
+    const time = Date.now() - start.t;
+    start = null;
+    if (time > 900) return;
+    if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+      turnMobilePage(dx < 0 ? 1 : -1);
+      return;
+    }
+    if (Math.abs(dx) > 12 || Math.abs(dy) > 12 || time > 600) return;
+    if (isReadingControlTarget(event.target)) return;
+    const selection = ownerDocument.getSelection?.();
+    if (selection && !selection.isCollapsed) return;
+    const width = ownerDocument.defaultView?.innerWidth || window.innerWidth;
+    const portion = event.clientX / Math.max(1, width);
+    if (portion >= .56) turnMobilePage(1);
+    else if (portion <= .24) turnMobilePage(-1);
+    else toggleMobileReadingControls();
+  }, {passive:true});
+}
+
+function startMobileEpubLocations(book) {
+  if (!isMobilePagedReading() || !book) return;
+  book.ready.then(async () => {
+    try {
+      await book.locations.generate(1500);
+      if (epubBook !== book) return;
+      mobilePageState.epubLocationsReady = true;
+      mobilePageState.epubLocationBook = book;
+      updateMobileProgressDisplay();
+    } catch (error) {
+      console.warn('EPUB 진행 위치 계산 실패', error);
+    }
+  });
+}
+
+initializeMobilePagedReading();
+
 /* =========================================================
    PWA 설치 및 폴더 관리 스타일
 ========================================================= */
