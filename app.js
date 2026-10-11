@@ -64,7 +64,8 @@ let readerState = {
     theme: "sepia",
     fontSize: 20,
     lineHeight: 1.9,
-    contentWidth: 850
+    contentWidth: 850,
+    brightness: 100
   },
 
   lastOpenedBookId: null,
@@ -199,15 +200,20 @@ const mobileBookTitle =
 window.addEventListener("load", () => {
 
   restoreStoredAccessToken();
-
+  restoreLocalReaderState();
   applySettings();
 
-  waitForGoogle();
+  initializeOfflineReaderLibrary().catch(error =>
+    console.warn("오프라인 서재 초기화 실패", error));
+
+  if (navigator.onLine) waitForGoogle();
 
 });
 
 
 function waitForGoogle() {
+
+  if (!navigator.onLine) return;
 
   if (
     window.google &&
@@ -246,6 +252,7 @@ function initGoogle() {
 
 
   if (
+    navigator.onLine &&
     localStorage.getItem(
       GOOGLE_CONNECTED_KEY
     ) === "1"
@@ -396,7 +403,7 @@ async function connectGoogleDrive() {
 
 
     if (
-      readerState.lastOpenedBookId
+      !selectedBook && readerState.lastOpenedBookId
     ) {
 
       const book =
@@ -404,6 +411,8 @@ async function connectGoogleDrive() {
           b =>
             b.id ===
             readerState.lastOpenedBookId
+        ) || readOfflineBookIndex().find(
+          b => b.id === readerState.lastOpenedBookId
         );
 
       if (book) {
@@ -413,6 +422,9 @@ async function connectGoogleDrive() {
       }
 
     }
+
+    if (hasPendingReaderSync()) await saveState();
+    updateOfflineSaveButtons();
 
   }
 
@@ -469,7 +481,7 @@ async function autoReconnectGoogleDrive() {
 
 
     if (
-      readerState.lastOpenedBookId
+      !selectedBook && readerState.lastOpenedBookId
     ) {
 
       const book =
@@ -477,6 +489,8 @@ async function autoReconnectGoogleDrive() {
           b =>
             b.id ===
             readerState.lastOpenedBookId
+        ) || readOfflineBookIndex().find(
+          b => b.id === readerState.lastOpenedBookId
         );
 
 
@@ -487,6 +501,9 @@ async function autoReconnectGoogleDrive() {
       }
 
     }
+
+    if (hasPendingReaderSync()) await saveState();
+    updateOfflineSaveButtons();
 
   }
 
@@ -939,6 +956,15 @@ async function driveRename(item) {
       selectedBook.name = name.trim(); mobileBookTitle.textContent = name.trim();
       if (item.mimeType !== "application/vnd.google-apps.folder") epubTitle.textContent = name.trim();
     }
+    if (hasOfflineBook(item.id)) {
+      // Drive 이름 변경 후 기기에 저장한 같은 책의 목록도 갱신합니다.
+      try {
+        const cached = await readOfflineBook(item.id);
+        if (cached) await saveOfflineBookRecord({...cached, name:name.trim()});
+        cacheOfflineBookIndex({id:item.id,name:name.trim(),
+          mimeType:item.mimeType});
+      } catch (error) { console.warn('오프라인 이름 갱신 실패',error); }
+    }
     await loadBooks();
   });
 }
@@ -1246,6 +1272,7 @@ async function openBook(book) {
   }
 
   resetAutoDisguiseTimer();
+  updateOfflineSaveButtons();
 
 }
 
@@ -1254,20 +1281,25 @@ async function openBook(book) {
    Drive 파일 다운로드
 ========================================================= */
 
-async function downloadDriveFile(
-  fileId
-) {
+async function downloadDriveFile(fileId) {
+  // 명시적으로 오프라인 저장한 책은 네트워크 없이도 그대로 열 수 있습니다.
+  let saved = null;
+  try { saved = await readOfflineBook(fileId); }
+  catch (error) {
+    console.warn('기기 저장소 조회 실패', error);
+    if (!navigator.onLine) throw new Error('이 기기에서 오프라인 저장소를 열 수 없습니다.');
+  }
+  if (saved?.blob) {
+    return new Response(saved.blob, {
+      status: 200,
+      headers: {"Content-Type": saved.mimeType || "application/octet-stream"}
+    });
+  }
 
-  const response =
-    await apiFetch(
-
-      `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`
-
-    );
-
-
-  return response;
-
+  if (!navigator.onLine) {
+    throw new Error("이 책은 아직 오프라인 저장되지 않았습니다. 인터넷에 연결해 저장해 주세요.");
+  }
+  return apiFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`);
 }
 
 
@@ -2214,6 +2246,7 @@ function applySettings() {
 
    
   applyEpubSettings();
+  applyReaderBrightness();
 
   if (isMobilePagedReading() && isMobileTxtBook()) {
     const ratio = mobilePageState.txtPages <= 1 ? 0 :
@@ -2320,18 +2353,11 @@ function applyEpubSettings() {
 ========================================================= */
 
 function scheduleStateSave() {
-
-  clearTimeout(
-    stateSaveTimer
-  );
-
-
-  stateSaveTimer =
-    setTimeout(
-      saveState,
-      1000
-    );
-
+  persistPendingReaderState();
+  clearTimeout(stateSaveTimer);
+  if (navigator.onLine && cloudReaderStateReady && accessToken) {
+    stateSaveTimer = setTimeout(() => { void saveState(); }, 1200);
+  }
 }
 
 
@@ -2372,7 +2398,8 @@ async function loadState() {
     ) {
 
       stateFileId = "";
-
+      cloudReaderStateReady = true;
+      applyPendingReaderState();
       return;
 
     }
@@ -2420,7 +2447,10 @@ async function loadState() {
         contentWidth:
           parsed.settings
             ?.contentWidth ||
-          850
+          850,
+
+        brightness: Math.max(20, Math.min(100,
+          Number(parsed.settings?.brightness ?? 100)))
 
       },
 
@@ -2438,10 +2468,14 @@ async function loadState() {
 
     };
 
+    cloudReaderStateReady = true;
+    applyPendingReaderState();
+
   }
 
   catch (error) {
-
+    cloudReaderStateReady = false;
+    restoreLocalReaderState();
     console.error(
       "상태 불러오기 실패",
       error
@@ -2456,94 +2490,41 @@ async function loadState() {
    appData 상태 저장
 ========================================================= */
 
+let readerStateUploadInFlight = null;
 async function saveState() {
+  // 인터넷이 끊겨도 위치는 이미 기기에 기록되어 있습니다.
+  if (!navigator.onLine || !accessToken || !cloudReaderStateReady ||
+      !hasPendingReaderSync()) return false;
+  if (readerStateUploadInFlight) return readerStateUploadInFlight;
 
-  if (!accessToken) {
-    return;
-  }
-
-
-  try {
-
-    const blob =
-      new Blob(
-
-        [
-
-          JSON.stringify(
-            readerState,
-            null,
-            2
-          )
-
-        ],
-
-        {
-
-          type:
-            "application/json"
-
-        }
-
-      );
-
-
-    const metadata =
-      stateFileId
-
-        ?
-
-        {
-
-          name:
-            STATE_FILE_NAME
-
-        }
-
-        :
-
-        {
-
-          name:
-            STATE_FILE_NAME,
-
-          parents: [
-            "appDataFolder"
-          ]
-
-        };
-
-
-    const result =
-      await multipartUpload(
-
-        metadata,
-
-        blob,
-
-        stateFileId || null
-
-      );
-
-
-    if (!stateFileId) {
-
-      stateFileId =
-        result.id;
-
+  readerStateUploadInFlight = (async () => {
+    const pendingVersion = getPendingReaderSync()?.version;
+    const snapshot = JSON.parse(JSON.stringify(readerState));
+    try {
+      const blob = new Blob([JSON.stringify(snapshot, null, 2)],
+        {type: "application/json"});
+      const metadata = stateFileId
+        ? {name: STATE_FILE_NAME}
+        : {name: STATE_FILE_NAME, parents: ["appDataFolder"]};
+      const result = await multipartUpload(metadata, blob, stateFileId || null);
+      if (!stateFileId) stateFileId = result.id;
+      // 업로드 도중 사용자가 더 읽은 경우에는 새 위치를 지우지 않습니다.
+      if (getPendingReaderSync()?.version === pendingVersion) {
+        localStorage.removeItem(OFFLINE_PENDING_STATE_KEY);
+        updateOfflineSyncStatus("Google Drive에 읽던 위치 저장됨");
+      }
+      else {
+        setTimeout(() => { void saveState(); }, 300);
+      }
+      return true;
+    } catch (error) {
+      console.warn("읽던 위치 온라인 동기화 대기", error);
+      updateOfflineSyncStatus("읽던 위치 기기에 저장됨 · 재연결 후 동기화");
+      return false;
     }
-
-  }
-
-  catch (error) {
-
-    console.error(
-      "상태 저장 실패",
-      error
-    );
-
-  }
-
+  })();
+  try { return await readerStateUploadInFlight; }
+  finally { readerStateUploadInFlight = null; }
 }
 
 
@@ -3097,7 +3078,7 @@ function initializeMobilePagedReading() {
 
   const ui = document.createElement('div');
   ui.id = 'mobileReaderUi';
-  ui.dataset.readerVersion = 'v9-tap-drag';
+  ui.dataset.readerVersion = 'v10-brightness-offline';
   ui.setAttribute('aria-label', '휴대폰 독서 메뉴');
   ui.innerHTML = `
     <div class="mobile-reader-top">
@@ -3117,6 +3098,7 @@ function initializeMobilePagedReading() {
       </div>
       <div class="mobile-reader-actions">
         <button id="mReaderToc" type="button">☷ 목차</button>
+        <button id="mReaderOfflineSave" type="button">↓ 오프라인 저장</button>
         <button id="mReaderSettings" type="button">⚙ 설정</button>
       </div>
     </div>
@@ -3144,6 +3126,8 @@ function initializeMobilePagedReading() {
     setMobileReadingControlsVisible(false);
     openSettings();
   });
+  ui.querySelector('#mReaderOfflineSave').addEventListener('click',
+    saveCurrentBookOffline);
   ui.querySelector('#mReaderPrevChapter').addEventListener('click', () => moveMobileChapter(-1));
   ui.querySelector('#mReaderNextChapter').addEventListener('click', () => moveMobileChapter(1));
 
@@ -3220,7 +3204,10 @@ function setMobileReadingControlsVisible(visible) {
   mobilePageState.controlsVisible = !!visible;
   document.body.classList.toggle('mobile-paged-controls-visible',
     !!visible && isMobilePagedReading());
-  if (visible) updateMobileProgressDisplay();
+  if (visible) {
+    updateMobileProgressDisplay();
+    updateOfflineSaveButtons();
+  }
 }
 
 function toggleMobileReadingControls() {
@@ -3961,7 +3948,7 @@ function startMobileEpubLocations(book) {
 }
 
 initializeMobilePagedReading();
-document.documentElement.dataset.readerBuild = 'v9-tap-drag';
+document.documentElement.dataset.readerBuild = 'v10-brightness-offline';
 
 /* =========================================================
    PWA 설치 및 폴더 관리 스타일
@@ -3970,8 +3957,8 @@ document.documentElement.dataset.readerBuild = 'v9-tap-drag';
   const link = document.createElement("link");
   link.rel = "manifest";
   link.href = isMobileReaderDevice()
-    ? "./manifest-android.webmanifest?v=7"
-    : "./manifest.webmanifest?v=7";
+    ? "./manifest-android.webmanifest?v=10"
+    : "./manifest.webmanifest?v=10";
   document.head.appendChild(link);
   const meta = document.createElement("meta");
   meta.name = "theme-color"; meta.content = "#efe0c3";
@@ -3988,12 +3975,12 @@ document.documentElement.dataset.readerBuild = 'v9-tap-drag';
   document.head.appendChild(style);
   if ("serviceWorker" in navigator && location.protocol === "https:") {
     window.addEventListener("load", () => {
-      navigator.serviceWorker.register("./sw.js?v=7").then(reg => {
+      navigator.serviceWorker.register("./sw.js?v=10").then(reg => {
         reg.update().catch(() => {});
         // 강제로 캐시를 삭제하지 않고 새 서비스 워커 활성화 후 한 번만 다시 읽습니다.
         navigator.serviceWorker.addEventListener('controllerchange', () => {
-          if (sessionStorage.getItem('reader-v7-updated') !== '1') {
-            sessionStorage.setItem('reader-v7-updated','1');
+          if (sessionStorage.getItem('reader-v10-updated') !== '1') {
+            sessionStorage.setItem('reader-v10-updated','1');
             location.reload();
           }
         });
@@ -4001,3 +3988,335 @@ document.documentElement.dataset.readerBuild = 'v9-tap-drag';
     });
   }
 })();
+
+
+
+/* =========================================================
+   v10: 밝기, 오프라인 책 저장, 연결 복구 시 읽던 위치 동기화
+   - 로컬에는 OAuth 토큰을 새로 저장하지 않습니다.
+   - 책 원본은 IndexedDB에 저장합니다.
+   - 읽던 위치는 소량의 JSON이므로 localStorage에 즉시 저장합니다.
+========================================================= */
+
+const OFFLINE_READER_DB = "drive-novel-offline-v1";
+const OFFLINE_READER_STORE = "books";
+const OFFLINE_BOOK_INDEX_KEY = "driveReaderOfflineBookIndexV1";
+const OFFLINE_LOCAL_STATE_KEY = "driveReaderLastLocalStateV1";
+const OFFLINE_PENDING_STATE_KEY = "driveReaderPendingSyncV1";
+let cloudReaderStateReady = false;
+let offlineStoreDbPromise = null;
+let lastOfflineStatus = "";
+
+function openOfflineReaderDb() {
+  if (!offlineStoreDbPromise) {
+    offlineStoreDbPromise = new Promise((resolve, reject) => {
+      if (!('indexedDB' in window)) {
+        reject(new Error('이 브라우저는 IndexedDB 오프라인 저장을 지원하지 않습니다.'));
+        return;
+      }
+      const request = indexedDB.open(OFFLINE_READER_DB, 1);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains(OFFLINE_READER_STORE)) {
+          request.result.createObjectStore(OFFLINE_READER_STORE, {keyPath:'id'});
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    }).catch(error => { offlineStoreDbPromise = null; throw error; });
+  }
+  return offlineStoreDbPromise;
+}
+
+async function saveOfflineBookRecord(record) {
+  const db = await openOfflineReaderDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(OFFLINE_READER_STORE, 'readwrite');
+    tx.objectStore(OFFLINE_READER_STORE).put(record);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('기기 저장소 쓰기 실패'));
+    tx.onabort = () => reject(tx.error || new Error('기기 저장 취소'));
+  });
+}
+
+async function readOfflineBook(fileId) {
+  const db = await openOfflineReaderDb();
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(OFFLINE_READER_STORE, 'readonly')
+      .objectStore(OFFLINE_READER_STORE).get(fileId);
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function readOfflineBookIndex() {
+  try { return JSON.parse(localStorage.getItem(OFFLINE_BOOK_INDEX_KEY) || '[]'); }
+  catch { return []; }
+}
+function hasOfflineBook(fileId) {
+  return readOfflineBookIndex().some(x => x.id === fileId);
+}
+function cacheOfflineBookIndex(record) {
+  const index = readOfflineBookIndex().filter(x => x.id !== record.id);
+  index.unshift({id:record.id, name:record.name, mimeType:record.mimeType,
+    modifiedTime:record.modifiedTime || '', savedAt: Date.now()});
+  localStorage.setItem(OFFLINE_BOOK_INDEX_KEY, JSON.stringify(index));
+}
+
+const EPUB_RUNTIME_URL =
+  'https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js';
+const READER_SHELL_CACHE = 'drive-novel-reader-v10-brightness-offline-20261011';
+async function ensureOfflineEpubReaderRuntime() {
+  if (!('caches' in window)) {
+    throw new Error('EPUB 오프라인 실행 파일을 저장할 수 없는 브라우저입니다.');
+  }
+  const cache = await caches.open(READER_SHELL_CACHE);
+  if (await cache.match(EPUB_RUNTIME_URL)) return;
+  const response = await fetch(EPUB_RUNTIME_URL, {mode:'cors'});
+  if (!response.ok) throw new Error('EPUB 실행 파일 내려받기에 실패했습니다.');
+  await cache.put(EPUB_RUNTIME_URL, response.clone());
+}
+
+async function saveCurrentBookOffline() {
+  if (!selectedBook) { alert('먼저 책을 열어 주세요.'); return; }
+  if (!navigator.onLine) {
+    alert(hasOfflineBook(selectedBook.id)
+      ? '이 책은 이미 오프라인 저장되어 있습니다.'
+      : '처음 저장할 때는 인터넷에 연결되어 있어야 합니다.');
+    return;
+  }
+  const originalBookId = selectedBook.id;
+  const originalBookName = selectedBook.name;
+  const menuButton = document.getElementById('mReaderOfflineSave');
+  if (menuButton) { menuButton.disabled = true; menuButton.textContent = '저장 중...'; }
+  if (desktopOfflineButton) { desktopOfflineButton.disabled = true;
+    desktopOfflineButton.textContent = '책을 기기에 저장 중...'; }
+
+  try {
+    // 기존 캐시가 있더라도 '저장'을 누르면 Drive에서 최신 원본으로 갱신합니다.
+    const response = await apiFetch(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(originalBookId)}?alt=media`);
+    const blob = await response.blob();
+    if (originalBookName.toLowerCase().endsWith('.epub')) {
+      // EPUB 파일을 읽는 라이브러리도 미리 보관해야 진짜 오프라인 읽기가 됩니다.
+      await ensureOfflineEpubReaderRuntime();
+    }
+    await saveOfflineBookRecord({id: originalBookId, name: originalBookName,
+      mimeType: originalBookName.toLowerCase().endsWith('.epub') ?
+        'application/epub+zip' : 'text/plain',
+      savedAt: Date.now(), blob});
+    cacheOfflineBookIndex({id:originalBookId,name:originalBookName,
+      mimeType: originalBookName.toLowerCase().endsWith('.epub') ?
+        'application/epub+zip' : 'text/plain'});
+    if (navigator.storage?.persist) {
+      navigator.storage.persist().catch(() => {});
+    }
+    updateOfflineSaveButtons();
+    alert('「' + originalBookName + '」 기기에 저장 완료!\n인터넷 없이도 이 앱에서 읽을 수 있습니다.');
+  } catch (error) {
+    alert('오프라인 저장 실패: ' + error.message +
+      '\n기기 저장 공간과 인터넷 연결을 확인하세요.');
+  } finally { updateOfflineSaveButtons(); }
+}
+
+let desktopOfflineButton = null;
+function initializeOfflineDownloadButtons() {
+  if (desktopOfflineButton || !sidebar) return;
+  desktopOfflineButton = document.createElement('button');
+  desktopOfflineButton.type = 'button';
+  desktopOfflineButton.className = 'main-button';
+  desktopOfflineButton.textContent = '↓ 현재 책 오프라인 저장';
+  desktopOfflineButton.addEventListener('click', saveCurrentBookOffline);
+  if (tocSection?.parentElement === sidebar) sidebar.insertBefore(desktopOfflineButton, tocSection);
+  else sidebar.appendChild(desktopOfflineButton);
+  updateOfflineSaveButtons();
+}
+function updateOfflineSaveButtons() {
+  const saved = !!selectedBook && hasOfflineBook(selectedBook.id);
+  const button = document.getElementById('mReaderOfflineSave');
+  const label = saved ? '✓ 저장됨 · 다시 받기' : '↓ 오프라인 저장';
+  if (button) { button.textContent = label; button.disabled = !selectedBook; }
+  if (desktopOfflineButton) {
+    desktopOfflineButton.textContent = selectedBook
+      ? (saved ? '✓ 현재 책 저장됨 · 새로 받기' : '↓ 현재 책 오프라인 저장')
+      : '↓ 책을 열면 오프라인 저장 가능';
+    desktopOfflineButton.disabled = !selectedBook;
+  }
+}
+
+function renderOfflineOnlyBookList() {
+  const saved = readOfflineBookIndex();
+  if (navigator.onLine && cloudReaderStateReady) return;
+  if (!saved.length) {
+    if (!navigator.onLine && bookList) bookList.textContent =
+      '오프라인에 저장한 책이 없습니다. 인터넷 연결 중에 책을 열고 「오프라인 저장」을 눌러 주세요.';
+    return;
+  }
+  books = saved.map(x => ({id:x.id,name:x.name,mimeType:x.mimeType}));
+  folders = [];
+  if (!bookList) return;
+  bookList.replaceChildren();
+  const status = document.createElement('div');
+  status.className = 'section-title';
+  status.textContent = '📥 오프라인 저장한 책 (' + saved.length + ')';
+  bookList.appendChild(status);
+  saved.forEach(book => {
+    const button = document.createElement('button');
+    button.className = 'book-item';
+    button.textContent = '📖 ' + book.name;
+    button.addEventListener('click', () => {
+      openBook(book).catch(error => alert('책을 열 수 없습니다: ' + error.message));
+    });
+    bookList.appendChild(button);
+  });
+  if (loginStatus && !navigator.onLine) loginStatus.textContent =
+    '오프라인 독서 · 읽던 위치는 이 기기에 저장됩니다';
+}
+async function initializeOfflineReaderLibrary() {
+  initializeOfflineDownloadButtons();
+  if (!navigator.onLine || !libraryFolderId) renderOfflineOnlyBookList();
+  // 기기 저장소 접근 가능 여부를 미리 확인하지만 실패해도 온라인 기능은 그대로 동작합니다.
+  try { await openOfflineReaderDb(); }
+  catch (error) { console.warn('오프라인 저장소 사용 불가', error); }
+}
+
+function getPendingReaderSync() {
+  try { return JSON.parse(localStorage.getItem(OFFLINE_PENDING_STATE_KEY) || 'null'); }
+  catch { return null; }
+}
+function hasPendingReaderSync() { return !!getPendingReaderSync(); }
+function persistPendingReaderState() {
+  try {
+    localStorage.setItem(OFFLINE_LOCAL_STATE_KEY, JSON.stringify(readerState));
+    const previous = getPendingReaderSync();
+    const touched = {...(previous?.bookIds || {})};
+    if (selectedBook?.id) touched[selectedBook.id] = Date.now();
+    localStorage.setItem(OFFLINE_PENDING_STATE_KEY,
+      JSON.stringify({version: Date.now() + Math.random(), bookIds:touched,
+        lastOpenedBookId: readerState.lastOpenedBookId,
+        settings:readerState.settings, state:readerState}));
+    if (!navigator.onLine) updateOfflineSyncStatus('오프라인 · 읽던 위치 기기에 저장됨');
+  } catch (error) { console.warn('기기 읽기 위치 저장 실패', error); }
+}
+function restoreLocalReaderState() {
+  try {
+    const local = JSON.parse(localStorage.getItem(OFFLINE_LOCAL_STATE_KEY) || 'null');
+    if (!local || !local.settings) return;
+    readerState = {
+      settings: {...readerState.settings, ...local.settings},
+      lastOpenedBookId: local.lastOpenedBookId || null,
+      txtProgress: local.txtProgress || {},
+      epubProgress: local.epubProgress || {}
+    };
+  } catch (error) { console.warn('기기 위치 복원 실패', error); }
+}
+function applyPendingReaderState() {
+  const pending = getPendingReaderSync();
+  if (pending?.state) {
+    const local = pending.state;
+    for (const id of Object.keys(pending.bookIds || {})) {
+      if (local.txtProgress?.[id]) readerState.txtProgress[id] = local.txtProgress[id];
+      if (local.epubProgress?.[id]) readerState.epubProgress[id] = local.epubProgress[id];
+    }
+    readerState.settings = {...readerState.settings, ...(pending.settings || {})};
+    if (pending.lastOpenedBookId) readerState.lastOpenedBookId = pending.lastOpenedBookId;
+  }
+  try { localStorage.setItem(OFFLINE_LOCAL_STATE_KEY, JSON.stringify(readerState)); }
+  catch (error) { console.warn('로컬 병합 저장 실패', error); }
+}
+function updateOfflineSyncStatus(text) {
+  lastOfflineStatus = text;
+  if (!navigator.onLine && loginStatus) loginStatus.textContent = text;
+  const note = document.getElementById('offlineReaderSyncNote');
+  if (note) note.textContent = text;
+}
+
+let brightnessOverlay = null;
+let brightnessRange = null;
+let brightnessValue = null;
+function initializeReaderBrightness() {
+  if (!settingsPanel || brightnessRange) return;
+  const label = document.createElement('label');
+  label.style.cssText = 'display:block;margin:14px 0;';
+  const title = document.createElement('span');
+  title.textContent = '☀ 읽기 화면 밝기 (앱 내부) ';
+  brightnessValue = document.createElement('span');
+  brightnessValue.textContent = '100%';
+  brightnessRange = document.createElement('input');
+  brightnessRange.type = 'range'; brightnessRange.min = '20';
+  brightnessRange.max = '100'; brightnessRange.step = '5';
+  brightnessRange.value = String(readerState.settings.brightness ?? 100);
+  brightnessRange.setAttribute('aria-label', '읽기 화면 밝기');
+  brightnessRange.style.cssText = 'display:block;width:100%;margin-top:10px;';
+  settingsPanel.style.maxHeight = 'calc(100dvh - 90px)';
+  settingsPanel.style.overflowY = 'auto';
+  brightnessRange.addEventListener('input', () => {
+    readerState.settings.brightness = Number(brightnessRange.value);
+    applyReaderBrightness();
+    scheduleStateSave();
+  });
+  label.append(title,brightnessValue,brightnessRange);
+  const firstLabel = settingsPanel.querySelector('label');
+  if (firstLabel) firstLabel.parentNode.insertBefore(label,firstLabel);
+  else settingsPanel.appendChild(label);
+  const note = document.createElement('small');
+  note.id='offlineReaderSyncNote';
+  note.style.cssText='display:block;opacity:.8;margin:8px 0;';
+  note.textContent=lastOfflineStatus || '읽던 위치는 자동으로 저장됩니다.';
+  settingsPanel.appendChild(note);
+  applyReaderBrightness();
+}
+function applyReaderBrightness() {
+  const percentage = Math.max(20, Math.min(100, Number(readerState.settings.brightness ?? 100)));
+  if (brightnessRange) brightnessRange.value = String(percentage);
+  if (brightnessValue) brightnessValue.textContent = percentage + '%';
+  if (!brightnessOverlay) {
+    brightnessOverlay = document.createElement('div');
+    brightnessOverlay.id = 'readerBrightnessOverlay';
+    Object.assign(brightnessOverlay.style, {
+      position:'fixed',inset:'0',width:'100vw',height:'100dvh',
+      pointerEvents:'none',zIndex:'9',background:'#000',opacity:'0'
+    });
+    document.body.appendChild(brightnessOverlay);
+  }
+  // 앱 화면만 어둡게 합니다. 실제 휴대폰의 시스템 밝기는 변경하지 않습니다.
+  brightnessOverlay.style.opacity = String((100-percentage) / 120);
+}
+
+async function tryResumeOfflineReaderSync() {
+  if (!navigator.onLine) return;
+  if (window.google?.accounts?.oauth2 && !tokenClient) initGoogle();
+  if (!tokenClient) {
+    // 오프라인 시작 때 원격 Google 스크립트가 로드되지 않았을 수 있습니다.
+    if (!document.getElementById('readerGisReconnectScript')) {
+      const script = document.createElement('script');
+      script.id = 'readerGisReconnectScript';
+      script.src = 'https://accounts.google.com/gsi/client';
+      script.async = true;
+      script.onload = waitForGoogle;
+      document.head.appendChild(script);
+    }
+    return;
+  }
+  if (cloudReaderStateReady && accessToken) {
+    if (hasPendingReaderSync()) await saveState();
+    if (libraryFolderId) await loadBooks();
+    return;
+  }
+  if (localStorage.getItem(GOOGLE_CONNECTED_KEY) === '1') {
+    await autoReconnectGoogleDrive();
+  }
+}
+window.addEventListener('online', () => {
+  updateOfflineSyncStatus('인터넷 연결됨 · 읽던 위치 동기화 시도 중...');
+  void tryResumeOfflineReaderSync().catch(error => console.warn('재연결 대기',error));
+});
+window.addEventListener('offline', () => {
+  updateOfflineSyncStatus('오프라인 · 읽던 위치 기기에 저장됨');
+  renderOfflineOnlyBookList();
+});
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && navigator.onLine && hasPendingReaderSync()) {
+    void tryResumeOfflineReaderSync().catch(() => {});
+  }
+});
+window.addEventListener('load', () => initializeReaderBrightness());
