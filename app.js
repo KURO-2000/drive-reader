@@ -3097,7 +3097,7 @@ function initializeMobilePagedReading() {
 
   const ui = document.createElement('div');
   ui.id = 'mobileReaderUi';
-  ui.dataset.readerVersion = 'v7-drag';
+  ui.dataset.readerVersion = 'v8-fast-drag';
   ui.setAttribute('aria-label', '휴대폰 독서 메뉴');
   ui.innerHTML = `
     <div class="mobile-reader-top">
@@ -3337,6 +3337,87 @@ function nextMobileAnimationFrame() {
   return new Promise(resolve => requestAnimationFrame(resolve));
 }
 
+/* =========================================================
+   v8 고속 페이지 미리보기
+   거대한 장 전체를 두 번 복제하지 않습니다.
+   브라우저가 이미 배치한 글자 위치를 이진 탐색하여
+   지금 보이는 페이지만 짧은 텍스트로 렌더링합니다.
+========================================================= */
+function mobileFastPageBoundary(pageNumber) {
+  const node = txtContent.firstChild;
+  const count = node?.nodeType === Node.TEXT_NODE ? node.length : 0;
+  if (!count || pageNumber <= 0) return 0;
+  if (pageNumber >= mobilePageState.txtPages) return count;
+
+  const stride = getMobileTxtPageStride();
+  const cssSig = `${stride}:${txtScrollArea.clientHeight}:${getComputedStyle(txtContent).fontSize}:${getComputedStyle(txtContent).lineHeight}`;
+  if (mobilePageState.fastBoundaryNode !== node ||
+      mobilePageState.fastBoundaryCss !== cssSig) {
+    mobilePageState.fastBoundaryNode = node;
+    mobilePageState.fastBoundaryCss = cssSig;
+    mobilePageState.fastBoundaryCache = new Map();
+  }
+  const cache = mobilePageState.fastBoundaryCache;
+  if (cache.has(pageNumber)) return cache.get(pageNumber);
+
+  // Range 위치는 이미 렌더링된 원본에서 읽으므로 재복제/재배치가 필요 없습니다.
+  const range = document.createRange();
+  const viewLeft = txtScrollArea.getBoundingClientRect().left;
+  const threshold = pageNumber * stride - 1;
+  let low = 0, high = count;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    range.setStart(node, mid);
+    range.setEnd(node, Math.min(count, mid + 1));
+    const x = range.getBoundingClientRect().left + txtScrollArea.scrollLeft - viewLeft;
+    if (x >= threshold) high = mid;
+    else low = mid + 1;
+  }
+  range.detach?.();
+  cache.set(pageNumber, low);
+  return low;
+}
+
+function mobileFastPreviewText(pageIndex, chapterDelta = 0) {
+  if (!chapterDelta) {
+    const start = mobileFastPageBoundary(pageIndex);
+    const end = mobileFastPageBoundary(pageIndex + 1);
+    return (txtContent.textContent || '').slice(start, Math.max(start, end));
+  }
+  const chapter = txtChapters[currentTxtChapter + chapterDelta];
+  const content = chapter?.content || '';
+  // 장을 넘기는 경계에만 쓰는 가벼운 미리보기(본문 전체 복제 없음).
+  return chapterDelta > 0 ? content.slice(0, 550) : content.slice(-550);
+}
+
+function mobileFastPreviewFace(pageIndex, chapterDelta, width) {
+  const face = document.createElement('div');
+  const css = getComputedStyle(txtContent);
+  const background = getComputedStyle(document.body).backgroundColor;
+  const innerWidth = Math.max(1, width - 32);
+  Object.assign(face.style, {
+    position:'absolute', inset:'0', overflow:'hidden',
+    background, pointerEvents:'none', contain:'paint'
+  });
+  const content = document.createElement('div');
+  const props = [
+    'font-family','font-size','font-weight','font-style',
+    'line-height','letter-spacing','color','white-space',
+    'word-break','overflow-wrap','text-align','text-indent'
+  ];
+  for (const name of props) content.style.setProperty(name, css.getPropertyValue(name));
+  Object.assign(content.style, {
+    width:`${innerWidth}px`, minWidth:`${innerWidth}px`,
+    height:'100%', maxHeight:'100%', boxSizing:'border-box',
+    margin:'0 16px', padding:'22px 0 36px',
+    columnCount:'auto', columnWidth:'auto', columnGap:'normal',
+    whiteSpace:'pre-wrap', overflowWrap:'anywhere'
+  });
+  content.textContent = mobileFastPreviewText(pageIndex, chapterDelta);
+  face.appendChild(content);
+  return face;
+}
+
 function makeMobilePageFlipSnapshot(direction, kind) {
   if (!isMobilePagedReading() || !mobilePageMotionEnabled()) return null;
   const source = kind === 'txt' ? txtScrollArea : epubViewer;
@@ -3366,38 +3447,9 @@ function makeMobilePageFlipSnapshot(direction, kind) {
   });
 
   if (kind === 'txt') {
-    // 기존 페이지를 별도로 복제해 넘기는 도중 글자가 유지되게 합니다.
-    const clone = txtScrollArea.cloneNode(true);
-    clone.removeAttribute('id');
-    clone.style.cssText = '';
-    Object.assign(clone.style, {
-      position:'absolute', inset:'0', width:'100%', height:'100%',
-      overflow:'hidden', background:surfaceColor,
-      margin:'0', padding:'0', pointerEvents:'none', flex:'none',
-      display:'block', touchAction:'none', scrollbarWidth:'none'
-    });
-    const originalText = txtContent;
-    const textClone = clone.firstElementChild;
-    if (textClone) {
-      textClone.removeAttribute('id');
-      const computed = getComputedStyle(originalText);
-      const props = ['box-sizing','font-size','font-family','font-weight','line-height',
-        'letter-spacing','color','white-space','overflow-wrap','word-break',
-        'text-align','text-indent','column-width','column-gap','column-fill'];
-      props.forEach(p => textClone.style.setProperty(p, computed.getPropertyValue(p)));
-      Object.assign(textClone.style, {
-        margin:'0 16px', width:`${Math.max(1,rect.width-32)}px`,
-        minWidth:`${Math.max(1,rect.width-32)}px`,
-        height:`${rect.height}px`, maxHeight:`${rect.height}px`,
-        padding:'22px 0 36px',
-        columnWidth:`${Math.max(1,rect.width-32)}px`,
-        columnGap:'32px', columnFill:'auto',
-        boxSizing:'border-box', whiteSpace:'pre-wrap'
-      });
-    }
-    paper.appendChild(clone);
-    // clone의 scrollLeft는 DOM에 붙인 뒤 계산해야 적용됩니다.
-    stage._copyScroll = () => { clone.scrollLeft = txtScrollArea.scrollLeft; };
+    // 한 페이지에 필요한 글자만 복사하므로 긴 장도 가볍습니다.
+    paper.appendChild(mobileFastPreviewFace(
+      mobilePageState.txtPageIndex, 0, rect.width));
   } else {
     // EPUB의 iframe 원본을 복제할 수 없으므로 종이면/그림자 효과만 적용.
     const paperShimmer = document.createElement('div');
@@ -3603,26 +3655,36 @@ function mobileDragCanMove(direction) {
   return true;
 }
 
-function mobileDragPlacePaper(drag, delta) {
+function mobileDragPlacePaper(drag, delta, immediate = false) {
   if (!drag?.stage || !drag.stage.isConnected) return;
   const width = Math.max(1, drag.width);
   const dx = drag.direction > 0
     ? Math.max(-width, Math.min(0, delta))
     : Math.min(width, Math.max(0, delta));
   drag.dx = dx;
-  const fraction = Math.min(1, Math.abs(dx) / width);
-  const angle = drag.direction > 0 ? -9 * fraction : 9 * fraction;
-  // 종이책처럼 살짝 기울고 그림자가 생기지만 손가락을 따라 정확히 이동합니다.
-  drag.paper.style.transform = `translate3d(${dx}px,0,0) rotateY(${angle}deg)`;
-  // 두 페이지가 나란히 연결되어 이동하도록 뒷장의 시작 위치도 같이 이동합니다.
-  if (drag.back) {
-    const backX = drag.direction > 0 ? width + dx : -width + dx;
-    drag.back.style.transform = `translate3d(${backX}px,0,0)`;
+  drag.pendingDx = dx;
+
+  // pointermove가 60~120회/초 발생해도 화면 갱신은 프레임당 최대 한 번.
+  const paint = () => {
+    drag.frameId = 0;
+    if (!drag.stage?.isConnected || drag.finishing) return;
+    const x = drag.pendingDx;
+    const fraction = Math.min(1, Math.abs(x) / width);
+    const angle = drag.direction > 0 ? -5 * fraction : 5 * fraction;
+    drag.paper.style.transform = `translate3d(${x}px,0,0) rotateY(${angle}deg)`;
+    if (drag.back) {
+      const backX = drag.direction > 0 ? width + x : -width + x;
+      drag.back.style.transform = `translate3d(${backX}px,0,0)`;
+    }
+    // 매 프레임 box-shadow/filter를 바꾸면 모바일 GPU가 느려집니다.
+    if (drag.shade) drag.shade.style.opacity = String(.15 + fraction * .35);
+  };
+  if (immediate) {
+    if (drag.frameId) cancelAnimationFrame(drag.frameId);
+    paint();
+  } else if (!drag.frameId) {
+    drag.frameId = requestAnimationFrame(paint);
   }
-  drag.paper.style.boxShadow = drag.direction > 0
-    ? `${4 + 20*fraction}px 0 ${10 + 25*fraction}px rgba(0,0,0,${.10 + .19*fraction})`
-    : `${-4 - 20*fraction}px 0 ${10 + 25*fraction}px rgba(0,0,0,${.10 + .19*fraction})`;
-  if (drag.shade) drag.shade.style.opacity = String(.12 + fraction*.6);
 }
 
 function mobileDragBuildStage(direction) {
@@ -3630,59 +3692,48 @@ function mobileDragBuildStage(direction) {
   const stage = makeMobilePageFlipSnapshot(direction, kind);
   if (!stage) return null;
   stage.style.overflow = 'hidden';
-  stage.style.perspective = '1400px';
+  // 평면 GPU 이동에 약한 3D 기울임만 남겨 메모리와 합성 비용을 최소화합니다.
+  stage.style.perspective = '1600px';
   const paper = stage._paper;
   paper.style.transformOrigin = 'center center';
   paper.style.willChange = 'transform';
   paper.style.borderRadius = '0';
+  paper.style.boxShadow = direction > 0
+    ? '7px 0 16px rgba(0,0,0,.14)'
+    : '-7px 0 16px rgba(0,0,0,.14)';
 
-  const back = paper.cloneNode(true);
+  // 무거운 전체 장 복제가 아닌 한 페이지만 별도로 구성합니다.
+  const back = document.createElement('div');
   back.className = 'mobile-paper-drag-next';
   Object.assign(back.style, {
+    position:'absolute', inset:'0', width:'100%', height:'100%',
     zIndex:'0', boxShadow:'none', borderRadius:'0',
+    background:getComputedStyle(document.body).backgroundColor,
     transform:`translate3d(${direction > 0 ? '100%' : '-100%'},0,0)`,
-    transformOrigin:'center center', willChange:'transform',
-    filter:'brightness(.97)'
+    willChange:'transform', backfaceVisibility:'hidden',
+    pointerEvents:'none', overflow:'hidden'
   });
-  const oldShade = back.lastElementChild;
-  if (oldShade && oldShade.style) oldShade.style.opacity = '0';
-
   if (kind === 'txt') {
-    // 드래그 중 아직 원래 읽기 위치를 바꾸지 않습니다.
-    // 복제된 뒤쪽 종이면에 다음/이전 페이지를 표시합니다.
-    const backScroll = back.firstElementChild;
-    const backText = backScroll?.firstElementChild;
     let neighbor = mobilePageState.txtPageIndex + direction;
-    let chapterChanged = false;
-    if (neighbor >= mobilePageState.txtPages && direction > 0) {
-      chapterChanged = true;
+    let chapterDelta = 0;
+    if (neighbor >= mobilePageState.txtPages) {
+      chapterDelta = 1;
       neighbor = 0;
-      if (backText) backText.textContent =
-        txtChapters[currentTxtChapter + 1]?.content || '';
-    } else if (neighbor < 0 && direction < 0) {
-      chapterChanged = true;
-      if (backText) backText.textContent =
-        txtChapters[currentTxtChapter - 1]?.content || '';
+    } else if (neighbor < 0) {
+      chapterDelta = -1;
+      neighbor = 0;
     }
-    const adjust = () => {
-      if (!stage.isConnected || !backScroll) return;
-      if (chapterChanged && direction < 0) {
-        backScroll.scrollLeft = Math.max(0,
-          backScroll.scrollWidth - backScroll.clientWidth);
-      } else if (chapterChanged) {
-        backScroll.scrollLeft = 0;
-      } else {
-        backScroll.scrollLeft = neighbor * getMobileTxtPageStride();
-      }
-    };
-    requestAnimationFrame(adjust);
-    stage._adjustPreview = adjust;
+    back.appendChild(mobileFastPreviewFace(neighbor, chapterDelta,
+      stage.getBoundingClientRect().width));
   } else {
-    // epub.js 프레임을 그대로 복제할 수 없어 텍스트 미리보기는 제한됩니다.
-    // 실제 EPUB 페이지 확정은 손가락을 뗄 때 수행합니다.
-    back.style.background = getComputedStyle(document.body).backgroundColor;
+    // iframe 내용을 통째로 복사할 수 없는 EPUB은 가벼운 종이면만 표시.
+    const tint = document.createElement('div');
+    Object.assign(tint.style, {
+      position:'absolute', inset:'0',
+      background:'linear-gradient(90deg,rgba(255,255,255,.08),transparent)'
+    });
+    back.appendChild(tint);
   }
-
   paper.style.zIndex = '1';
   stage.insertBefore(back, paper);
   return {stage, paper, shade:stage._shade, back};
@@ -3702,7 +3753,7 @@ function beginMobilePageDrag(gesture, direction) {
   gesture.width = built.stage.getBoundingClientRect().width || window.innerWidth;
   gesture.dragging = true;
   setMobileReadingControlsVisible(false);
-  mobileDragPlacePaper(gesture, 0);
+  mobileDragPlacePaper(gesture, 0, true);
   return true;
 }
 
@@ -3734,6 +3785,9 @@ async function mobileDragCommitPage(direction) {
 
 async function finishMobilePageDrag(gesture, commit) {
   if (!gesture?.dragging || gesture.finishing) return;
+  // 마지막 예약 프레임이 이동 완료 애니메이션과 충돌하지 않게 취소.
+  if (gesture.frameId) cancelAnimationFrame(gesture.frameId);
+  gesture.frameId = 0;
   gesture.finishing = true;
   const dir = gesture.direction;
   const finalX = commit ? -dir * gesture.width : 0;
@@ -3756,7 +3810,7 @@ async function finishMobilePageDrag(gesture, commit) {
         ], {duration,easing:'cubic-bezier(.22,.65,.2,1)',fill:'forwards'});
         const animation = gesture.paper.animate([
           {transform:gesture.paper.style.transform, offset:0},
-          {transform:`translate3d(${finalX}px,0,0) rotateY(${dir > 0 ? -9 : 9}deg)`,offset:1}
+          {transform:`translate3d(${finalX}px,0,0) rotateY(${dir > 0 ? -5 : 5}deg)`,offset:1}
         ], {duration, easing:'cubic-bezier(.22,.65,.2,1)', fill:'forwards'});
         await Promise.all([
           animation.finished.catch(() => {}),
@@ -3841,7 +3895,7 @@ function bindMobilePageGestures(target, ownerDocument) {
     if (current.dragging) {
       if (event.cancelable) event.preventDefault();
       const dx = event.clientX - current.x;
-      mobileDragPlacePaper(current, dx);
+      mobileDragPlacePaper(current, dx, true);
       const dt = Math.max(1, performance.now() - current.t);
       const velocity = Math.abs(dx) / dt;
       const distance = Math.abs(current.dx || 0);
@@ -3885,7 +3939,7 @@ function startMobileEpubLocations(book) {
 }
 
 initializeMobilePagedReading();
-document.documentElement.dataset.readerBuild = 'v7-drag';
+document.documentElement.dataset.readerBuild = 'v8-fast-drag';
 
 /* =========================================================
    PWA 설치 및 폴더 관리 스타일
