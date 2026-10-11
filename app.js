@@ -3078,7 +3078,7 @@ function initializeMobilePagedReading() {
 
   const ui = document.createElement('div');
   ui.id = 'mobileReaderUi';
-  ui.dataset.readerVersion = 'v10-brightness-offline';
+  ui.dataset.readerVersion = 'v11-flip-brightness';
   ui.setAttribute('aria-label', '휴대폰 독서 메뉴');
   ui.innerHTML = `
     <div class="mobile-reader-top">
@@ -3457,6 +3457,22 @@ function makeMobilePageFlipSnapshot(direction, kind) {
   });
   paper.appendChild(shade);
   stage.appendChild(paper);
+
+  // v11: 일반 독서 화면의 밝기 오버레이(z-index:9)보다
+  // 페이지 넘김 레이어(z-index:1900)가 앞에 그려집니다.
+  // 전환 중인 앞/뒤 종이도 같은 밝기로 보이도록 별도 어둡기 레이어를 추가합니다.
+  // stage에 고정하고 종이 자체에는 붙이지 않아서 드래그 시 밝기가 변하지 않습니다.
+  const flipDimmer = document.createElement('div');
+  flipDimmer.className = 'mobile-paper-flip-dimmer';
+  Object.assign(flipDimmer.style, {
+    position:'absolute', inset:'0',
+    background:'#000',
+    opacity:String((100 - Math.max(20, Math.min(100,
+      Number(readerState.settings.brightness ?? 100)))) / 120),
+    pointerEvents:'none', zIndex:'5'
+  });
+  stage.appendChild(flipDimmer);
+
   document.body.appendChild(stage);
   stage._paper = paper;
   stage._shade = shade;
@@ -3948,7 +3964,7 @@ function startMobileEpubLocations(book) {
 }
 
 initializeMobilePagedReading();
-document.documentElement.dataset.readerBuild = 'v10-brightness-offline';
+document.documentElement.dataset.readerBuild = 'v11-flip-brightness';
 
 /* =========================================================
    PWA 설치 및 폴더 관리 스타일
@@ -4064,7 +4080,7 @@ function cacheOfflineBookIndex(record) {
 
 const EPUB_RUNTIME_URL =
   'https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js';
-const READER_SHELL_CACHE = 'drive-novel-reader-v10-brightness-offline-20261011';
+const READER_SHELL_CACHE = 'drive-novel-reader-v11-flip-brightness-20261012';
 async function ensureOfflineEpubReaderRuntime() {
   if (!('caches' in window)) {
     throw new Error('EPUB 오프라인 실행 파일을 저장할 수 없는 브라우저입니다.');
@@ -4279,7 +4295,13 @@ function applyReaderBrightness() {
     document.body.appendChild(brightnessOverlay);
   }
   // 앱 화면만 어둡게 합니다. 실제 휴대폰의 시스템 밝기는 변경하지 않습니다.
-  brightnessOverlay.style.opacity = String((100-percentage) / 120);
+  const dimOpacity = String((100-percentage) / 120);
+  brightnessOverlay.style.opacity = dimOpacity;
+
+  // 설정에서 밝기를 바꾸는 순간 이미 열린 페이지 전환 레이어도 갱신합니다.
+  document.querySelectorAll('.mobile-paper-flip-dimmer').forEach(
+    layer => { layer.style.opacity = dimOpacity; }
+  );
 }
 
 async function tryResumeOfflineReaderSync() {
