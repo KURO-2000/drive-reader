@@ -37,6 +37,9 @@ let libraryFolderId = "";
 let stateFileId = "";
 
 let books = [];
+let folders = [];
+let currentFolderId = "";
+let folderPath = [];
 
 let selectedBook = null;
 
@@ -828,122 +831,159 @@ async function ensureLibraryFolder() {
    책 목록
 ========================================================= */
 
-async function loadBooks() {
-
-  if (!libraryFolderId) {
-    return;
-  }
-
-
-  const query =
-    encodeURIComponent(
-
-      `'${libraryFolderId}' in parents and trashed=false`
-
-    );
-
-
-  const response =
-    await apiFetch(
-
-      "https://www.googleapis.com/drive/v3/files" +
-      `?q=${query}` +
-      "&fields=files(id,name,mimeType,size,modifiedTime)" +
-      "&orderBy=modifiedTime desc" +
-      "&pageSize=500"
-
-    );
-
-
-  const data =
-    await response.json();
-
-
-  books =
-    (data.files || [])
-      .filter(
-        file =>
-          /\.(txt|epub)$/i
-            .test(file.name)
-      );
-
-
-  renderBooks();
-
+async function driveListChildren(folderId) {
+  const all = [];
+  let pageToken = "";
+  do {
+    const query = encodeURIComponent(`'${folderId}' in parents and trashed=false`);
+    const url = "https://www.googleapis.com/drive/v3/files?q=" + query +
+      "&fields=" + encodeURIComponent("nextPageToken,files(id,name,mimeType,parents,size,modifiedTime)") +
+      "&pageSize=1000&orderBy=" + encodeURIComponent("folder,name") +
+      (pageToken ? "&pageToken=" + encodeURIComponent(pageToken) : "");
+    const response = await apiFetch(url);
+    const data = await response.json();
+    all.push(...(data.files || []));
+    pageToken = data.nextPageToken || "";
+  } while (pageToken);
+  return all;
 }
 
-
-/* =========================================================
-   책 목록 표시
-========================================================= */
+async function loadBooks() {
+  if (!libraryFolderId) return;
+  if (!currentFolderId) currentFolderId = libraryFolderId;
+  const items = await driveListChildren(currentFolderId);
+  folders = items.filter(item => item.mimeType === "application/vnd.google-apps.folder");
+  books = items.filter(item => item.mimeType !== "application/vnd.google-apps.folder" && /\.(txt|epub)$/i.test(item.name));
+  renderBooks();
+}
 
 function renderBooks() {
-
-  const keyword =
-    bookSearch.value
-      .trim()
-      .toLowerCase();
-
-
+  const keyword = bookSearch.value.trim().toLowerCase();
   bookList.innerHTML = "";
-
-
-  const filtered =
-    books.filter(
-
-      book =>
-        book.name
-          .toLowerCase()
-          .includes(keyword)
-
-    );
-
-
-  filtered.forEach(
-    book => {
-
-      const button =
-        document.createElement(
-          "button"
-        );
-
-
-      button.className =
-        "book-item";
-
-
-      if (
-        selectedBook &&
-        selectedBook.id ===
-        book.id
-      ) {
-
-        button.classList.add(
-          "active"
-        );
-
-      }
-
-
-      button.textContent =
-        book.name;
-
-
-      button.addEventListener(
-        "click",
-        () => openBook(book)
-      );
-
-
-      bookList.appendChild(
-        button
-      );
-
-    }
-  );
-
+  const controls = document.createElement("div");
+  controls.className = "library-controls";
+  const makeBtn = (label, handler) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = label;
+    btn.className = "library-action";
+    btn.addEventListener("click", handler);
+    return btn;
+  };
+  controls.append(makeBtn("📁 새 폴더", createLibraryFolder), makeBtn("🔄 새로고침", () => runLibraryAction(loadBooks)));
+  const breadcrumb = document.createElement("div");
+  breadcrumb.className = "library-breadcrumb";
+  breadcrumb.append(makeBtn("📚 서재", () => openLibraryFolder(libraryFolderId, [])));
+  folderPath.forEach((part, i) => breadcrumb.append(makeBtn("› " + part.name, () => openLibraryFolder(part.id, folderPath.slice(0, i + 1)))));
+  bookList.append(controls, breadcrumb);
+  if (currentFolderId !== libraryFolderId) {
+    bookList.append(makeBtn("⬅ 상위 폴더", () => {
+      const parent = folderPath.slice(0, -1);
+      openLibraryFolder(parent.length ? parent[parent.length - 1].id : libraryFolderId, parent);
+    }));
+  }
+  folders.filter(f => f.name.toLowerCase().includes(keyword)).forEach(folder => {
+    const row = document.createElement("div"); row.className = "library-row";
+    const open = makeBtn("📁 " + folder.name, () => openLibraryFolder(folder.id, [...folderPath, {id:folder.id,name:folder.name}]));
+    open.classList.add("book-item");
+    const menu = makeBtn("⋯", () => showLibraryMenu(folder, true));
+    menu.setAttribute("aria-label", folder.name + " 관리");
+    row.append(open, menu); bookList.append(row);
+  });
+  books.filter(b => b.name.toLowerCase().includes(keyword)).forEach(book => {
+    const row = document.createElement("div"); row.className = "library-row";
+    const open = makeBtn("📖 " + book.name, () => openBook(book));
+    open.classList.add("book-item");
+    if (selectedBook && selectedBook.id === book.id) open.classList.add("active");
+    const menu = makeBtn("⋯", () => showLibraryMenu(book, false));
+    menu.setAttribute("aria-label", book.name + " 관리");
+    row.append(open, menu); bookList.append(row);
+  });
 }
 
+async function runLibraryAction(action) {
+  try { await action(); }
+  catch (error) { console.error(error); alert("Drive 작업 실패: " + error.message); }
+}
+
+async function openLibraryFolder(id, path) {
+  await runLibraryAction(async () => {
+    currentFolderId = id; folderPath = path; bookSearch.value = "";
+    await loadBooks();
+  });
+}
+
+async function createLibraryFolder() {
+  const name = prompt("새 폴더 이름을 입력하세요.");
+  if (!name || !name.trim()) return;
+  await runLibraryAction(async () => {
+    await apiFetch("https://www.googleapis.com/drive/v3/files", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({name:name.trim(),mimeType:"application/vnd.google-apps.folder",parents:[currentFolderId || libraryFolderId]})
+    });
+    await loadBooks();
+  });
+}
+
+async function driveRename(item) {
+  const name = prompt("새 이름을 입력하세요.", item.name);
+  if (!name || !name.trim() || name === item.name) return;
+  if (item.mimeType !== "application/vnd.google-apps.folder" && !/\.(txt|epub)$/i.test(name.trim())) {
+    alert("TXT/EPUB 파일 확장자를 유지해 주세요."); return;
+  }
+  await runLibraryAction(async () => {
+    await apiFetch("https://www.googleapis.com/drive/v3/files/" + encodeURIComponent(item.id), {
+      method:"PATCH", headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name.trim()})
+    });
+    if (selectedBook && selectedBook.id === item.id) {
+      selectedBook.name = name.trim(); mobileBookTitle.textContent = name.trim();
+      if (item.mimeType !== "application/vnd.google-apps.folder") epubTitle.textContent = name.trim();
+    }
+    await loadBooks();
+  });
+}
+
+async function listAllFolders(rootId, ancestorIds = new Set(), depth = 0) {
+  if (depth > 20) return [];
+  const children = await driveListChildren(rootId);
+  const result = [];
+  for (const child of children.filter(x => x.mimeType === "application/vnd.google-apps.folder")) {
+    if (ancestorIds.has(child.id)) continue;
+    result.push({id:child.id,name:child.name,depth});
+    const next = new Set(ancestorIds); next.add(child.id);
+    result.push(...await listAllFolders(child.id, next, depth + 1));
+  }
+  return result;
+}
+
+async function driveMove(item, isFolder) {
+  await runLibraryAction(async () => {
+    const destinations = [{id:libraryFolderId,name:"📚 서재 (최상위)",depth:0}, ...await listAllFolders(libraryFolderId)];
+    const filtered = destinations.filter(f => f.id !== item.id);
+    const names = filtered.map((f,i) => `${i + 1}. ${"　".repeat(f.depth)}${f.name}`);
+    const choice = prompt("이동할 폴더 번호를 입력하세요.\n\n" + names.join("\n"));
+    if (choice === null) return;
+    const index = Number(choice) - 1;
+    if (!Number.isInteger(index) || index < 0 || index >= filtered.length) { alert("올바른 번호를 입력하세요."); return; }
+    const target = filtered[index];
+    if (target.id === currentFolderId) return;
+    if (isFolder) {
+      const descendants = await listAllFolders(item.id);
+      if (descendants.some(f => f.id === target.id)) { alert("폴더를 자신의 하위 폴더로 이동할 수 없습니다."); return; }
+    }
+    const parentId = (item.parents || [currentFolderId])[0];
+    const params = new URLSearchParams({addParents:target.id,fields:"id,name,parents"});
+    if (parentId) params.set("removeParents",parentId);
+    await apiFetch("https://www.googleapis.com/drive/v3/files/" + encodeURIComponent(item.id) + "?" + params.toString(), {method:"PATCH"});
+    await loadBooks();
+  });
+}
+
+function showLibraryMenu(item, isFolder) {
+  const action = prompt(`「${item.name}」 관리\n1. 이름 변경\n2. 다른 폴더로 이동\n\n번호를 입력하세요.`);
+  if (action === "1") driveRename(item);
+  else if (action === "2") driveMove(item, isFolder);
+}
 
 bookSearch.addEventListener(
   "input",
@@ -1034,7 +1074,7 @@ async function uploadBook(file) {
       file.name,
 
     parents: [
-      libraryFolderId
+      currentFolderId || libraryFolderId
     ]
 
   };
@@ -2600,6 +2640,21 @@ function clearAutoDisguiseTimer() {
 }
 
 
+/* Android 및 모바일 기기에서는 자동 검은 화면을 사용하지 않습니다.
+   Windows PC에서는 기존 10분 타이머를 그대로 사용합니다.
+   수동 Ctrl+G 위장 기능은 변경하지 않습니다. */
+function isMobileReaderDevice() {
+
+  return (
+    navigator.userAgentData?.mobile === true ||
+    /Android|iPhone|iPad|iPod|Mobile/i.test(
+      navigator.userAgent || ""
+    )
+  );
+
+}
+
+
 function resetAutoDisguiseTimer() {
 
   clearAutoDisguiseTimer();
@@ -2607,7 +2662,8 @@ function resetAutoDisguiseTimer() {
 
   if (
     !selectedBook ||
-    disguiseMode
+    disguiseMode ||
+    isMobileReaderDevice()
   ) {
 
     return;
@@ -2623,7 +2679,8 @@ function resetAutoDisguiseTimer() {
 
         if (
           selectedBook &&
-          !disguiseMode
+          !disguiseMode &&
+          !isMobileReaderDevice()
         ) {
 
           setDisguiseMode(true);
@@ -2796,3 +2853,30 @@ window.addEventListener(
 
   }
 );
+/* =========================================================
+   PWA 설치 및 폴더 관리 스타일
+========================================================= */
+(function initializeReaderPwa() {
+  const link = document.createElement("link");
+  link.rel = "manifest";
+  link.href = "./manifest.webmanifest";
+  document.head.appendChild(link);
+  const meta = document.createElement("meta");
+  meta.name = "theme-color"; meta.content = "#efe0c3";
+  document.head.appendChild(meta);
+  const style = document.createElement("style");
+  style.textContent = `
+    .library-controls { display:flex; gap:6px; margin:8px 0; flex-wrap:wrap; }
+    .library-action { border:1px solid rgba(120,120,120,.35); border-radius:7px; background:transparent; color:inherit; padding:6px 8px; cursor:pointer; font-size:13px; }
+    .library-breadcrumb { display:flex; flex-wrap:wrap; gap:3px; margin:8px 0 12px; }
+    .library-row { display:flex; align-items:center; gap:3px; width:100%; }
+    .library-row .book-item { flex:1; min-width:0; overflow-wrap:anywhere; }
+    .library-row .library-action { flex:none; margin-bottom:5px; font-size:18px; }
+  `;
+  document.head.appendChild(style);
+  if ("serviceWorker" in navigator && location.protocol === "https:") {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("./sw.js").catch(error => console.warn("PWA 등록 실패", error));
+    });
+  }
+})();
