@@ -3097,7 +3097,7 @@ function initializeMobilePagedReading() {
 
   const ui = document.createElement('div');
   ui.id = 'mobileReaderUi';
-  ui.dataset.readerVersion = 'v8-fast-drag';
+  ui.dataset.readerVersion = 'v9-tap-drag';
   ui.setAttribute('aria-label', '휴대폰 독서 메뉴');
   ui.innerHTML = `
     <div class="mobile-reader-top">
@@ -3569,6 +3569,28 @@ async function turnMobileEpubPage(direction) {
 
 function turnMobilePage(direction) {
   if (!isMobilePagedReading() || mobilePageState.pageTurning) return;
+  if (!mobileDragCanMove(direction)) return;
+
+  // 짧은 터치도 드래그와 완전히 동일한 페이지 무대와
+  // 다음 페이지 미리보기를 사용하여 움직입니다.
+  // 손가락 이동량만 0으로 시작하고 끝까지 자동으로 넘깁니다.
+  if (mobilePageMotionEnabled()) {
+    const gesture = {
+      direction,
+      dx: 0,
+      dragging: false,
+      finishing: false,
+      frameId: 0
+    };
+    if (beginMobilePageDrag(gesture, direction)) {
+      // 드래그와 같은 finish 함수를 이용하므로
+      // 3D 슬라이드, 뒤쪽 페이지 노출, 그림자 및 저장을 공유합니다.
+      void finishMobilePageDrag(gesture, true);
+      return;
+    }
+  }
+
+  // 모션 줄이기 설정이나 저사양 브라우저에서는 기존 전환을 유지합니다.
   if (isMobileTxtBook()) {
     void turnMobileTxtPage(direction);
   } else {
@@ -3939,7 +3961,7 @@ function startMobileEpubLocations(book) {
 }
 
 initializeMobilePagedReading();
-document.documentElement.dataset.readerBuild = 'v8-fast-drag';
+document.documentElement.dataset.readerBuild = 'v9-tap-drag';
 
 /* =========================================================
    PWA 설치 및 폴더 관리 스타일
