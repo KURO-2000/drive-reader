@@ -2929,7 +2929,8 @@ const mobilePageState = {
   epubLocationBook: null,
   epubLocation: null,
   sliderDragging: false,
-  resizeTimer: null
+  resizeTimer: null,
+  pageTurning: false
 };
 
 function isMobileReadingLayout() {
@@ -3111,7 +3112,6 @@ function initializeMobilePagedReading() {
       </div>
       <div class="mobile-reader-actions">
         <button id="mReaderToc" type="button">☷ 목차</button>
-        <button id="mReaderFont" type="button">Aa 글자</button>
         <button id="mReaderSettings" type="button">⚙ 설정</button>
       </div>
     </div>
@@ -3134,11 +3134,6 @@ function initializeMobilePagedReading() {
     sidebar.classList.add('open');
     overlay.classList.remove('hidden');
     tocSection.scrollIntoView({block:'start'});
-  });
-  ui.querySelector('#mReaderFont').addEventListener('click', () => {
-    setMobileReadingControlsVisible(false);
-    openSettings();
-    fontSizeRange.focus({preventScroll:true});
   });
   ui.querySelector('#mReaderSettings').addEventListener('click', () => {
     setMobileReadingControlsVisible(false);
@@ -3178,6 +3173,7 @@ function initializeMobilePagedReading() {
 }
 
 function prepareMobilePagedBook() {
+  mobilePageState.pageTurning = false;
   initializeMobilePagedReading();
   document.body.classList.toggle('mobile-paged-reading', isMobileReadingLayout());
   setMobileReadingControlsVisible(false);
@@ -3293,43 +3289,161 @@ function updateMobileProgressDisplay() {
   }
 }
 
-function turnMobileTxtPage(direction) {
-  if (!isMobilePagedReading() || !isMobileTxtBook()) return;
-  if (direction > 0 && mobilePageState.txtPageIndex >= mobilePageState.txtPages - 1) {
-    moveTxtChapter(currentTxtChapter + 1);
+/* =========================================================
+   모바일 페이지 전환 모션
+   TXT: 실제 페이지가 좌우로 부드럽게 이동 (약 260ms)
+   EPUB: 화면이 옆으로 사라졌다가 새 페이지가 나타남
+   멀미/접근성 설정(동작 줄이기)을 존중합니다.
+========================================================= */
+
+function mobilePageMotionEnabled() {
+  return !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+function nextMobileAnimationFrame() {
+  return new Promise(resolve => requestAnimationFrame(resolve));
+}
+
+async function animateMobileTxtTo(left) {
+  const from = txtScrollArea.scrollLeft;
+  const difference = left - from;
+  if (!mobilePageMotionEnabled() || Math.abs(difference) < 2) {
+    txtScrollArea.scrollLeft = left;
     return;
+  }
+
+  // CSS smooth scroll보다 움직임이 일정하고 페이지 끝 위치가 정확합니다.
+  await new Promise(resolve => {
+    const duration = 260;
+    let startTime = null;
+    function frame(time) {
+      if (!isMobilePagedReading() || !isMobileTxtBook()) {
+        resolve();
+        return;
+      }
+      if (startTime === null) startTime = time;
+      const t = Math.min(1, (time - startTime) / duration);
+      const eased = 1 - Math.pow(1 - t, 3);
+      txtScrollArea.scrollLeft = from + difference * eased;
+      if (t < 1) requestAnimationFrame(frame);
+      else {
+        txtScrollArea.scrollLeft = left;
+        resolve();
+      }
+    }
+    requestAnimationFrame(frame);
+  });
+}
+
+async function animateMobileReaderSurface(element, direction, entering) {
+  if (!element || !mobilePageMotionEnabled() || !element.animate) return;
+  const sign = direction > 0 ? 1 : -1;
+  const frames = entering
+    ? [
+        { transform:`translateX(${sign * 32}px)`, opacity:0.3 },
+        { transform:'translateX(0)', opacity:1 }
+      ]
+    : [
+        { transform:'translateX(0)', opacity:1 },
+        { transform:`translateX(${-sign * 32}px)`, opacity:0.3 }
+      ];
+  const animation = element.animate(frames, {
+    duration: entering ? 190 : 135,
+    easing:'ease-out',
+    fill:'none'
+  });
+  await animation.finished.catch(() => {});
+}
+
+async function animateMobileTxtChapter(direction, targetIndex, ratio = 0) {
+  if (mobilePageState.pageTurning || targetIndex < 0 ||
+      targetIndex >= txtChapters.length) return;
+  mobilePageState.pageTurning = true;
+  try {
+    await animateMobileReaderSurface(txtScrollArea, direction, false);
+    await moveTxtChapter(targetIndex, ratio);
+    // renderTxtChapter가 예약한 두 번의 requestAnimationFrame 완료를 기다립니다.
+    await nextMobileAnimationFrame();
+    await nextMobileAnimationFrame();
+    await nextMobileAnimationFrame();
+    await animateMobileReaderSurface(txtScrollArea, direction, true);
+  } finally {
+    mobilePageState.pageTurning = false;
+    updateMobileProgressDisplay();
+  }
+}
+
+async function turnMobileTxtPage(direction) {
+  if (!isMobilePagedReading() || !isMobileTxtBook() ||
+      mobilePageState.pageTurning) return;
+
+  if (direction > 0 && mobilePageState.txtPageIndex >= mobilePageState.txtPages - 1) {
+    return animateMobileTxtChapter(1, currentTxtChapter + 1);
   }
   if (direction < 0 && mobilePageState.txtPageIndex <= 0) {
-    if (currentTxtChapter > 0) moveTxtChapter(currentTxtChapter - 1, 1);
-    return;
+    return animateMobileTxtChapter(-1, currentTxtChapter - 1, 1);
   }
-  mobilePageState.txtPageIndex = Math.max(0,
-    Math.min(mobilePageState.txtPages - 1, mobilePageState.txtPageIndex + direction));
-  txtScrollArea.scrollLeft = mobilePageState.txtPageIndex * getMobileTxtPageStride();
-  rememberMobileTxtProgress();
-  updateMobileProgressDisplay();
+
+  mobilePageState.pageTurning = true;
+  try {
+    const index = Math.max(0, Math.min(mobilePageState.txtPages - 1,
+      mobilePageState.txtPageIndex + direction));
+    await animateMobileTxtTo(index * getMobileTxtPageStride());
+    mobilePageState.txtPageIndex = index;
+    rememberMobileTxtProgress();
+    updateMobileProgressDisplay();
+  } finally {
+    mobilePageState.pageTurning = false;
+  }
+}
+
+async function turnMobileEpubPage(direction) {
+  if (!epubRendition || mobilePageState.pageTurning) return;
+  mobilePageState.pageTurning = true;
+  try {
+    const rendition = epubRendition;
+    await animateMobileReaderSurface(epubViewer, direction, false);
+    if (rendition === epubRendition) {
+      if (direction > 0) await rendition.next();
+      else await rendition.prev();
+    }
+    await animateMobileReaderSurface(epubViewer, direction, true);
+  } catch (error) {
+    console.warn('EPUB 페이지 전환 실패', error);
+  } finally {
+    mobilePageState.pageTurning = false;
+    updateMobileProgressDisplay();
+  }
 }
 
 function turnMobilePage(direction) {
-  if (!isMobilePagedReading()) return;
+  if (!isMobilePagedReading() || mobilePageState.pageTurning) return;
   if (isMobileTxtBook()) {
-    turnMobileTxtPage(direction);
+    void turnMobileTxtPage(direction);
   } else {
-    if (direction > 0) epubRendition?.next();
-    else epubRendition?.prev();
+    void turnMobileEpubPage(direction);
   }
 }
 
-function moveMobileChapter(direction) {
-  if (!isMobilePagedReading()) return;
+async function moveMobileChapter(direction) {
+  if (!isMobilePagedReading() || mobilePageState.pageTurning) return;
   if (isMobileTxtBook()) {
-    moveTxtChapter(currentTxtChapter + direction);
+    await animateMobileTxtChapter(direction, currentTxtChapter + direction);
     return;
   }
   const current = epubBook?.spine?.get(mobilePageState.epubLocation?.start?.cfi);
   const dest = direction > 0 ? current?.next() : current?.prev();
-  if (dest) {
-    epubRendition?.display(dest.href || dest.idref);
+  if (!dest || !epubRendition) return;
+  mobilePageState.pageTurning = true;
+  try {
+    await animateMobileReaderSurface(epubViewer, direction, false);
+    await epubRendition.display(dest.href || dest.idref);
+    await animateMobileReaderSurface(epubViewer, direction, true);
+  } catch (error) {
+    console.warn('EPUB 장 이동 실패', error);
+  } finally {
+    mobilePageState.pageTurning = false;
+    updateMobileProgressDisplay();
   }
 }
 
