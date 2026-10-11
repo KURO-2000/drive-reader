@@ -3093,6 +3093,7 @@ function initializeMobilePagedReading() {
 
   const ui = document.createElement('div');
   ui.id = 'mobileReaderUi';
+  ui.dataset.readerVersion = 'v6-bookflip';
   ui.setAttribute('aria-label', '휴대폰 독서 메뉴');
   ui.innerHTML = `
     <div class="mobile-reader-top">
@@ -3155,6 +3156,31 @@ function initializeMobilePagedReading() {
     mobilePageState.sliderDragging = false;
     seekMobileBookProgress(Number(mobilePageState.slider.value) / 1000);
   });
+
+  // 화면을 최대한 넓게 쓰고 싶은 사용자는 설정에서 전체화면을 선택할 수 있습니다.
+  // 기기/브라우저에 따라 Android 시스템 버튼은 남을 수 있습니다.
+  if (isMobileReaderDevice() && settingsPanel &&
+      !document.getElementById('mobileReaderFullscreenBtn')) {
+    const fullBtn = document.createElement('button');
+    fullBtn.type = 'button';
+    fullBtn.id = 'mobileReaderFullscreenBtn';
+    fullBtn.textContent = '⛶ 휴대폰 전체화면 켜기 / 끄기';
+    Object.assign(fullBtn.style, {
+      width:'100%', padding:'12px', marginTop:'10px',
+      borderRadius:'8px', border:'1px solid #aaa',
+      background:'transparent', color:'inherit', fontSize:'14px'
+    });
+    fullBtn.addEventListener('click', async () => {
+      try {
+        if (document.fullscreenElement) await document.exitFullscreen();
+        else await document.documentElement.requestFullscreen({navigationUI:'hide'});
+        closeSettings();
+      } catch (error) {
+        alert('이 브라우저에서는 전체화면 실행이 제한되어 있습니다. 앱을 홈 화면에서 실행해 주세요.');
+      }
+    });
+    settingsPanel.appendChild(fullBtn);
+  }
 
   bindMobilePageGestures(txtScrollArea, document);
   window.addEventListener('resize', () => {
@@ -3290,12 +3316,11 @@ function updateMobileProgressDisplay() {
 }
 
 /* =========================================================
-   모바일 페이지 전환 모션
-   TXT: 실제 페이지가 좌우로 부드럽게 이동 (약 260ms)
-   EPUB: 화면이 옆으로 사라졌다가 새 페이지가 나타남
-   멀미/접근성 설정(동작 줄이기)을 존중합니다.
+   모바일 종이책 넘김 모션 v6
+   실제 TXT의 현재 페이지를 복제하여 3D 종이처럼 접히게 표시합니다.
+   EPUB도 책장 면/그림자 효과를 적용합니다.
+   운영체제의 '동작 줄이기'가 켜져 있으면 모션을 생략합니다.
 ========================================================= */
-
 function mobilePageMotionEnabled() {
   return !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
@@ -3304,55 +3329,122 @@ function nextMobileAnimationFrame() {
   return new Promise(resolve => requestAnimationFrame(resolve));
 }
 
-async function animateMobileTxtTo(left) {
-  const from = txtScrollArea.scrollLeft;
-  const difference = left - from;
-  if (!mobilePageMotionEnabled() || Math.abs(difference) < 2) {
-    txtScrollArea.scrollLeft = left;
-    return;
+function makeMobilePageFlipSnapshot(direction, kind) {
+  if (!isMobilePagedReading() || !mobilePageMotionEnabled()) return null;
+  const source = kind === 'txt' ? txtScrollArea : epubViewer;
+  if (!source) return null;
+  const rect = source.getBoundingClientRect();
+  if (rect.width < 20 || rect.height < 20) return null;
+
+  const surfaceColor = getComputedStyle(document.body).backgroundColor;
+  const stage = document.createElement('div');
+  stage.className = 'mobile-paper-flip-stage';
+  Object.assign(stage.style, {
+    position:'fixed', left:`${rect.left}px`, top:`${rect.top}px`,
+    width:`${rect.width}px`, height:`${rect.height}px`,
+    pointerEvents:'none', perspective:'1150px',
+    overflow:'visible', zIndex:'1900', isolation:'isolate'
+  });
+
+  const paper = document.createElement('div');
+  paper.className = 'mobile-paper-flip-sheet';
+  Object.assign(paper.style, {
+    position:'absolute', inset:'0', width:'100%', height:'100%',
+    background:surfaceColor, overflow:'hidden',
+    transformOrigin: direction > 0 ? 'left center' : 'right center',
+    transformStyle:'preserve-3d', backfaceVisibility:'hidden',
+    boxShadow:direction > 0 ? '8px 0 24px rgba(0,0,0,.16)' : '-8px 0 24px rgba(0,0,0,.16)',
+    borderRadius:direction > 0 ? '0 7px 7px 0' : '7px 0 0 7px'
+  });
+
+  if (kind === 'txt') {
+    // 기존 페이지를 별도로 복제해 넘기는 도중 글자가 유지되게 합니다.
+    const clone = txtScrollArea.cloneNode(true);
+    clone.removeAttribute('id');
+    clone.style.cssText = '';
+    Object.assign(clone.style, {
+      position:'absolute', inset:'0', width:'100%', height:'100%',
+      overflow:'hidden', background:surfaceColor,
+      margin:'0', padding:'0', pointerEvents:'none', flex:'none',
+      display:'block', touchAction:'none', scrollbarWidth:'none'
+    });
+    const originalText = txtContent;
+    const textClone = clone.firstElementChild;
+    if (textClone) {
+      textClone.removeAttribute('id');
+      const computed = getComputedStyle(originalText);
+      const props = ['box-sizing','font-size','font-family','font-weight','line-height',
+        'letter-spacing','color','white-space','overflow-wrap','word-break',
+        'text-align','text-indent','column-width','column-gap','column-fill'];
+      props.forEach(p => textClone.style.setProperty(p, computed.getPropertyValue(p)));
+      Object.assign(textClone.style, {
+        margin:'0 16px', width:`${Math.max(1,rect.width-32)}px`,
+        minWidth:`${Math.max(1,rect.width-32)}px`,
+        height:`${rect.height}px`, maxHeight:`${rect.height}px`,
+        padding:'22px 0 36px',
+        columnWidth:`${Math.max(1,rect.width-32)}px`,
+        columnGap:'32px', columnFill:'auto',
+        boxSizing:'border-box', whiteSpace:'pre-wrap'
+      });
+    }
+    paper.appendChild(clone);
+    // clone의 scrollLeft는 DOM에 붙인 뒤 계산해야 적용됩니다.
+    stage._copyScroll = () => { clone.scrollLeft = txtScrollArea.scrollLeft; };
+  } else {
+    // EPUB의 iframe 원본을 복제할 수 없으므로 종이면/그림자 효과만 적용.
+    const paperShimmer = document.createElement('div');
+    Object.assign(paperShimmer.style, {
+      position:'absolute',inset:'0', background:
+      'linear-gradient(90deg,rgba(255,255,255,.04),rgba(255,255,255,.22) 85%,rgba(0,0,0,.04))'
+    });
+    paper.appendChild(paperShimmer);
   }
 
-  // CSS smooth scroll보다 움직임이 일정하고 페이지 끝 위치가 정확합니다.
-  await new Promise(resolve => {
-    const duration = 260;
-    let startTime = null;
-    function frame(time) {
-      if (!isMobilePagedReading() || !isMobileTxtBook()) {
-        resolve();
-        return;
-      }
-      if (startTime === null) startTime = time;
-      const t = Math.min(1, (time - startTime) / duration);
-      const eased = 1 - Math.pow(1 - t, 3);
-      txtScrollArea.scrollLeft = from + difference * eased;
-      if (t < 1) requestAnimationFrame(frame);
-      else {
-        txtScrollArea.scrollLeft = left;
-        resolve();
-      }
-    }
-    requestAnimationFrame(frame);
+  const shade = document.createElement('div');
+  Object.assign(shade.style, {
+    position:'absolute', inset:'0', pointerEvents:'none',
+    background:direction > 0 ?
+      'linear-gradient(to right,transparent 62%,rgba(0,0,0,.25))' :
+      'linear-gradient(to left,transparent 62%,rgba(0,0,0,.25))',
+    opacity:'0', zIndex:'2'
   });
+  paper.appendChild(shade);
+  stage.appendChild(paper);
+  document.body.appendChild(stage);
+  stage._paper = paper;
+  stage._shade = shade;
+  stage._copyScroll?.();
+  return stage;
 }
 
-async function animateMobileReaderSurface(element, direction, entering) {
-  if (!element || !mobilePageMotionEnabled() || !element.animate) return;
-  const sign = direction > 0 ? 1 : -1;
-  const frames = entering
-    ? [
-        { transform:`translateX(${sign * 32}px)`, opacity:0.3 },
-        { transform:'translateX(0)', opacity:1 }
-      ]
-    : [
-        { transform:'translateX(0)', opacity:1 },
-        { transform:`translateX(${-sign * 32}px)`, opacity:0.3 }
-      ];
-  const animation = element.animate(frames, {
-    duration: entering ? 190 : 135,
-    easing:'ease-out',
-    fill:'none'
-  });
-  await animation.finished.catch(() => {});
+async function animateMobilePageFlip(direction, kind, performTurn) {
+  if (!mobilePageMotionEnabled()) {
+    await performTurn();
+    return;
+  }
+  const snapshot = makeMobilePageFlipSnapshot(direction, kind);
+  if (!snapshot) {
+    await performTurn();
+    return;
+  }
+  try {
+    await performTurn();
+    await nextMobileAnimationFrame();
+    const angle = direction > 0 ? -105 : 105;
+    const animation = snapshot._paper.animate([
+      {transform:'rotateY(0deg) scaleX(1)', filter:'brightness(1)', offset:0},
+      {transform:`rotateY(${angle*.22}deg) scaleX(.985)`, filter:'brightness(.97)', offset:.28},
+      {transform:`rotateY(${angle*.65}deg) scaleX(.94)`, filter:'brightness(.85)', offset:.72},
+      {transform:`rotateY(${angle}deg) scaleX(.95)`, filter:'brightness(.78)', offset:1}
+    ], {duration:480, easing:'cubic-bezier(.25,.65,.18,1)', fill:'forwards'});
+    const shading = snapshot._shade.animate([
+      {opacity:0}, {opacity:.95,offset:.65}, {opacity:.55}
+    ], {duration:480, easing:'ease-in-out', fill:'forwards'});
+    await animation.finished.catch(() => {});
+    shading.cancel();
+  } finally {
+    snapshot.remove();
+  }
 }
 
 async function animateMobileTxtChapter(direction, targetIndex, ratio = 0) {
@@ -3360,13 +3452,12 @@ async function animateMobileTxtChapter(direction, targetIndex, ratio = 0) {
       targetIndex >= txtChapters.length) return;
   mobilePageState.pageTurning = true;
   try {
-    await animateMobileReaderSurface(txtScrollArea, direction, false);
-    await moveTxtChapter(targetIndex, ratio);
-    // renderTxtChapter가 예약한 두 번의 requestAnimationFrame 완료를 기다립니다.
-    await nextMobileAnimationFrame();
-    await nextMobileAnimationFrame();
-    await nextMobileAnimationFrame();
-    await animateMobileReaderSurface(txtScrollArea, direction, true);
+    await animateMobilePageFlip(direction, 'txt', async () => {
+      await moveTxtChapter(targetIndex, ratio);
+      await nextMobileAnimationFrame();
+      await nextMobileAnimationFrame();
+      await nextMobileAnimationFrame();
+    });
   } finally {
     mobilePageState.pageTurning = false;
     updateMobileProgressDisplay();
@@ -3376,22 +3467,22 @@ async function animateMobileTxtChapter(direction, targetIndex, ratio = 0) {
 async function turnMobileTxtPage(direction) {
   if (!isMobilePagedReading() || !isMobileTxtBook() ||
       mobilePageState.pageTurning) return;
-
-  if (direction > 0 && mobilePageState.txtPageIndex >= mobilePageState.txtPages - 1) {
+  if (direction > 0 && mobilePageState.txtPageIndex >= mobilePageState.txtPages - 1)
     return animateMobileTxtChapter(1, currentTxtChapter + 1);
-  }
-  if (direction < 0 && mobilePageState.txtPageIndex <= 0) {
+  if (direction < 0 && mobilePageState.txtPageIndex <= 0)
     return animateMobileTxtChapter(-1, currentTxtChapter - 1, 1);
-  }
 
   mobilePageState.pageTurning = true;
   try {
     const index = Math.max(0, Math.min(mobilePageState.txtPages - 1,
       mobilePageState.txtPageIndex + direction));
-    await animateMobileTxtTo(index * getMobileTxtPageStride());
-    mobilePageState.txtPageIndex = index;
-    rememberMobileTxtProgress();
-    updateMobileProgressDisplay();
+    const newLeft = index * getMobileTxtPageStride();
+    await animateMobilePageFlip(direction, 'txt', () => {
+      txtScrollArea.scrollLeft = newLeft;
+      mobilePageState.txtPageIndex = index;
+      rememberMobileTxtProgress();
+      updateMobileProgressDisplay();
+    });
   } finally {
     mobilePageState.pageTurning = false;
   }
@@ -3402,12 +3493,12 @@ async function turnMobileEpubPage(direction) {
   mobilePageState.pageTurning = true;
   try {
     const rendition = epubRendition;
-    await animateMobileReaderSurface(epubViewer, direction, false);
-    if (rendition === epubRendition) {
-      if (direction > 0) await rendition.next();
-      else await rendition.prev();
-    }
-    await animateMobileReaderSurface(epubViewer, direction, true);
+    await animateMobilePageFlip(direction, 'epub', async () => {
+      if (rendition === epubRendition) {
+        if (direction > 0) await rendition.next();
+        else await rendition.prev();
+      }
+    });
   } catch (error) {
     console.warn('EPUB 페이지 전환 실패', error);
   } finally {
@@ -3436,9 +3527,8 @@ async function moveMobileChapter(direction) {
   if (!dest || !epubRendition) return;
   mobilePageState.pageTurning = true;
   try {
-    await animateMobileReaderSurface(epubViewer, direction, false);
-    await epubRendition.display(dest.href || dest.idref);
-    await animateMobileReaderSurface(epubViewer, direction, true);
+    await animateMobilePageFlip(direction, 'epub', () =>
+      epubRendition.display(dest.href || dest.idref));
   } catch (error) {
     console.warn('EPUB 장 이동 실패', error);
   } finally {
@@ -3534,6 +3624,7 @@ function startMobileEpubLocations(book) {
 }
 
 initializeMobilePagedReading();
+document.documentElement.dataset.readerBuild = 'v6-bookflip';
 
 /* =========================================================
    PWA 설치 및 폴더 관리 스타일
@@ -3541,7 +3632,9 @@ initializeMobilePagedReading();
 (function initializeReaderPwa() {
   const link = document.createElement("link");
   link.rel = "manifest";
-  link.href = "./manifest.webmanifest";
+  link.href = isMobileReaderDevice()
+    ? "./manifest-android.webmanifest?v=6"
+    : "./manifest.webmanifest?v=6";
   document.head.appendChild(link);
   const meta = document.createElement("meta");
   meta.name = "theme-color"; meta.content = "#efe0c3";
@@ -3558,7 +3651,16 @@ initializeMobilePagedReading();
   document.head.appendChild(style);
   if ("serviceWorker" in navigator && location.protocol === "https:") {
     window.addEventListener("load", () => {
-      navigator.serviceWorker.register("./sw.js").catch(error => console.warn("PWA 등록 실패", error));
+      navigator.serviceWorker.register("./sw.js?v=6").then(reg => {
+        reg.update().catch(() => {});
+        // 강제로 캐시를 삭제하지 않고 새 서비스 워커 활성화 후 한 번만 다시 읽습니다.
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+          if (sessionStorage.getItem('reader-v6-updated') !== '1') {
+            sessionStorage.setItem('reader-v6-updated','1');
+            location.reload();
+          }
+        });
+      }).catch(error => console.warn("PWA 등록 실패", error));
     });
   }
 })();
