@@ -203,10 +203,17 @@ window.addEventListener("load", () => {
   restoreLocalReaderState();
   applySettings();
 
-  initializeOfflineReaderLibrary().catch(error =>
-    console.warn("오프라인 서재 초기화 실패", error));
-
-  if (navigator.onLine) waitForGoogle();
+  // 저장된 책부터 즉시 열고, Google Drive 연결은 뒤에서 시도합니다.
+  // 로그인/네트워크가 늦어도 독서 화면이 먼저 준비됩니다.
+  void initializeOfflineReaderLibrary().then(async () => {
+    const lastId = readerState.lastOpenedBookId;
+    const local = readOfflineBookIndex().find(book => book.id === lastId);
+    if (local && !selectedBook) {
+      try { await openBook(local); }
+      catch (error) { console.warn('저장된 책 빠른 복원 실패', error); }
+    }
+  }).catch(error => console.warn('오프라인 서재 초기화 실패', error));
+  if (navigator.onLine) setTimeout(waitForGoogle, 2800);
 
 });
 
@@ -1265,7 +1272,7 @@ async function openBook(book) {
 
   setMobileReadingControlsVisible(false);
 
-  if (isMobilePagedReading() && isMobileTxtBook()) {
+  if (isMobilePagedReading() && isMobileTxtBook() && !isVirtualMobileTxt()) {
     requestAnimationFrame(() =>
       finishMobileTxtRender(readerState.txtProgress[book.id]?.pageRatio ??
         readerState.txtProgress[book.id]?.scrollRatio ?? 0));
@@ -1311,22 +1318,30 @@ async function openTxtBook(book) {
 
   destroyEpub();
 
-
-  const response =
-    await downloadDriveFile(
-      book.id
-    );
-
-
-  const text =
-    await response.text();
-
-
-  txtChapters =
-    splitTxtIntoChapters(
-      text
-    );
-
+  // v14: 다운로드한 TXT의 분리된 장을 우선 불러옵니다.
+  // 캐시가 있으면 원본 Blob 디코딩/정규식 장 분리를 반복하지 않습니다.
+  let stored = null;
+  const localBook = hasOfflineBook(book.id) ? await readOfflineBook(book.id) : null;
+  if (localBook?.blob) {
+    const parsed = await readReaderCacheRecord(TXT_PARSED_STORE, book.id);
+    if (parsed?.version === TXT_CACHE_FORMAT_VERSION &&
+        parsed.savedAt === localBook.savedAt &&
+        Array.isArray(parsed.chapters) && parsed.chapters.length) {
+      stored = parsed.chapters;
+    }
+  }
+  if (!stored) {
+    const response = await downloadDriveFile(book.id);
+    const text = await response.text();
+    stored = splitTxtIntoChapters(text);
+    if (localBook?.blob) {
+      await writeReaderCacheRecord(TXT_PARSED_STORE, {
+        id: book.id, savedAt: localBook.savedAt,
+        version: TXT_CACHE_FORMAT_VERSION, chapters: stored
+      });
+    }
+  }
+  txtChapters = stored;
   buildMobileTxtLengthIndex();
 
 
@@ -1537,8 +1552,11 @@ function renderTxtChapter(
     chapter.title;
 
 
-  txtContent.textContent =
-    chapter.content;
+  if (isMobilePagedReading() && isMobileTxtBook()) {
+    txtContent.textContent = '읽던 페이지를 준비하는 중...';
+  } else {
+    txtContent.textContent = chapter.content;
+  }
 
 
   prevChapterBtn.disabled =
@@ -1561,11 +1579,12 @@ function renderTxtChapter(
             txtScrollArea.clientHeight;
 
 
-          if (isMobilePagedReading()) {
+          if (isVirtualMobileTxt()) {
+            void activateVirtualTxtChapter(restoreRatio);
+          } else if (isMobilePagedReading()) {
             finishMobileTxtRender(restoreRatio);
           } else {
-            txtScrollArea.scrollTop = max > 0 ?
-              max * restoreRatio : 0;
+            txtScrollArea.scrollTop = max > 0 ? max * restoreRatio : 0;
           }
 
         }
@@ -1697,6 +1716,7 @@ async function moveTxtChapter(
     };
 
 
+  if (isVirtualMobileTxt()) virtualTxtEpoch++;
   renderTxtChapter(restoreRatio);
 
 
@@ -2247,8 +2267,12 @@ function applySettings() {
    
   applyEpubSettings();
   applyReaderBrightness();
+  if (isVirtualMobileTxt() && virtualTxtActive &&
+      virtualTxtActive.signature !== virtualTxtLayoutSignature()) {
+    void virtualTxtRefreshAfterResize();
+  }
 
-  if (isMobilePagedReading() && isMobileTxtBook()) {
+  if (isMobilePagedReading() && isMobileTxtBook() && !isVirtualMobileTxt()) {
     const ratio = mobilePageState.txtPages <= 1 ? 0 :
       mobilePageState.txtPageIndex / (mobilePageState.txtPages - 1);
     requestAnimationFrame(() => finishMobileTxtRender(ratio));
@@ -3089,7 +3113,7 @@ function initializeMobilePagedReading() {
 
   const ui = document.createElement('div');
   ui.id = 'mobileReaderUi';
-  ui.dataset.readerVersion = 'v13-deep-resume';
+  ui.dataset.readerVersion = 'v14-txt-page-cache';
   ui.setAttribute('aria-label', '휴대폰 독서 메뉴');
   ui.innerHTML = `
     <div class="mobile-reader-top">
@@ -3227,6 +3251,10 @@ function getMobileTxtPageCount() {
 }
 
 function finishMobileTxtRender(ratio = 0) {
+  if (isVirtualMobileTxt()) {
+    void activateVirtualTxtChapter(ratio);
+    return;
+  }
   if (!isMobilePagedReading() || !isMobileTxtBook()) return;
   const pageCount = getMobileTxtPageCount();
   mobilePageState.txtPages = pageCount;
@@ -3239,6 +3267,10 @@ function finishMobileTxtRender(ratio = 0) {
 }
 
 function rememberMobileTxtProgress() {
+  if (isVirtualMobileTxt()) {
+    saveVirtualMobileTxtProgress();
+    return;
+  }
   if (!isMobilePagedReading() || !isMobileTxtBook()) return;
   const ratio = mobilePageState.txtPages <= 1 ? 0 :
     mobilePageState.txtPageIndex / (mobilePageState.txtPages - 1);
@@ -3262,6 +3294,12 @@ function buildMobileTxtLengthIndex() {
 
 function getMobileBookPercent() {
   if (isMobileTxtBook()) {
+    if (isVirtualMobileTxt()) {
+      const chapterStart = mobilePageState.chapterPrefix[currentTxtChapter] || 0;
+      const offset = virtualTxtCurrentOffset();
+      return Math.max(0, Math.min(1,
+        (chapterStart + offset) / mobilePageState.totalChars));
+    }
     const start = mobilePageState.chapterPrefix[currentTxtChapter] || 0;
     const len = Math.max(1, txtChapters[currentTxtChapter]?.content?.length || 1);
     const r = mobilePageState.txtPages <= 1 ? 0 :
@@ -3291,8 +3329,17 @@ function updateMobileProgressDisplay() {
   mobilePageState.controls.querySelector('#mReaderTitle').textContent = selectedBook?.name || '';
   let label;
   if (isMobileTxtBook()) {
-    label = `${currentTxtChapter + 1}/${txtChapters.length}장 · ` +
-      `${mobilePageState.txtPageIndex + 1}/${mobilePageState.txtPages}페이지 · 전체 ${Math.round(percent*100)}%`;
+    if (isVirtualMobileTxt()) {
+      const layout = virtualTxtActive;
+      const pages = layout?.complete
+        ? String(layout.boundaries.length - 1)
+        : `약 ${virtualTxtApproximatePageCount(layout)}`;
+      label = `${currentTxtChapter + 1}/${txtChapters.length}장 · ` +
+        `${mobilePageState.txtPageIndex + 1}/${pages}페이지 · 전체 ${Math.round(percent*100)}%`;
+    } else {
+      label = `${currentTxtChapter + 1}/${txtChapters.length}장 · ` +
+        `${mobilePageState.txtPageIndex + 1}/${mobilePageState.txtPages}페이지 · 전체 ${Math.round(percent*100)}%`;
+    }
   } else {
     const loc = mobilePageState.epubLocation?.start?.displayed;
     const pageText = loc?.total ? `${loc.page}/${loc.total}페이지` : '페이지 확인 중';
@@ -3376,6 +3423,14 @@ function mobileFastPageBoundary(pageNumber) {
 }
 
 function mobileFastPreviewText(pageIndex, chapterDelta = 0) {
+  if (isVirtualMobileTxt() && !chapterDelta) {
+    virtualTxtEnsurePage(pageIndex);
+    const boundaries = virtualTxtActive?.boundaries;
+    const chapter = txtChapters[currentTxtChapter]?.content || '';
+    const a = boundaries?.[pageIndex] ?? 0;
+    const b = boundaries?.[pageIndex + 1] ?? a;
+    return chapter.slice(a, b);
+  }
   if (!chapterDelta) {
     const start = mobileFastPageBoundary(pageIndex);
     const end = mobileFastPageBoundary(pageIndex + 1);
@@ -3540,6 +3595,15 @@ async function animateMobileTxtChapter(direction, targetIndex, ratio = 0) {
 }
 
 async function turnMobileTxtPage(direction) {
+  if (isVirtualMobileTxt()) {
+    if (mobilePageState.pageTurning) return;
+    mobilePageState.pageTurning = true;
+    try {
+      await animateMobilePageFlip(direction, 'txt', () =>
+        virtualTxtCommitPage(direction));
+    } finally { mobilePageState.pageTurning = false; }
+    return;
+  }
   if (!isMobilePagedReading() || !isMobileTxtBook() ||
       mobilePageState.pageTurning) return;
   if (direction > 0 && mobilePageState.txtPageIndex >= mobilePageState.txtPages - 1)
@@ -3650,8 +3714,10 @@ async function seekMobileBookProgress(p) {
     const length = Math.max(1, txtChapters[low]?.content?.length || 1);
     const within = Math.max(0, Math.min(1,
       (chars - mobilePageState.chapterPrefix[low]) / length));
-    if (low !== currentTxtChapter) moveTxtChapter(low, within);
-    else {
+    if (low !== currentTxtChapter) await moveTxtChapter(low, within);
+    else if (isVirtualMobileTxt()) {
+      void virtualTxtSeekRatio(within);
+    } else {
       finishMobileTxtRender(within);
       rememberMobileTxtProgress();
     }
@@ -3681,6 +3747,16 @@ async function seekMobileBookProgress(p) {
 ========================================================= */
 
 function mobileDragCanMove(direction) {
+  if (isVirtualMobileTxt()) {
+    if (!virtualTxtActive || virtualTxtActive.bookId !== selectedBook?.id ||
+        virtualTxtActive.chapterIndex !== currentTxtChapter) return false;
+    if (direction > 0) {
+      virtualTxtEnsurePage(mobilePageState.txtPageIndex + 1);
+      return mobilePageState.txtPageIndex < virtualTxtKnownPageCount() - 1 ||
+        currentTxtChapter < txtChapters.length - 1;
+    }
+    return mobilePageState.txtPageIndex > 0 || currentTxtChapter > 0;
+  }
   if (isMobileTxtBook()) {
     if (direction > 0) {
       return mobilePageState.txtPageIndex < mobilePageState.txtPages - 1 ||
@@ -3799,6 +3875,10 @@ function beginMobilePageDrag(gesture, direction) {
 
 async function mobileDragCommitPage(direction) {
   if (!isMobilePagedReading()) return;
+  if (isVirtualMobileTxt()) {
+    await virtualTxtCommitPage(direction);
+    return;
+  }
   if (isMobileTxtBook()) {
     let nextIndex = mobilePageState.txtPageIndex + direction;
     if (nextIndex >= 0 && nextIndex < mobilePageState.txtPages) {
@@ -4009,6 +4089,10 @@ function scheduleMobileViewportRefresh(delay = 700) {
       return;
     }
     if (isMobileTxtBook()) {
+      if (isVirtualMobileTxt()) {
+        void virtualTxtRefreshAfterResize();
+        return;
+      }
       // 현재 페이지 비율을 보존하면서 딱 한 번만 페이지 수 재계산.
       const ratio = mobilePageState.txtPages <= 1 ? 0 :
         mobilePageState.txtPageIndex / (mobilePageState.txtPages - 1);
@@ -4197,6 +4281,352 @@ document.documentElement.dataset.readerBuild = 'v13-deep-resume';
 
 
 /* =========================================================
+   v14 TXT: 원본/장/페이지 캐시 + 현재 페이지 단독 렌더링
+   - TXT 원본은 기존 books IndexedDB에 그대로 보관
+   - 분리된 장과 페이지 경계는 IndexedDB에 캐시
+   - DOM에는 현재 페이지 텍스트만 표시 (긴 장 전체 렌더 방지)
+   - 처음 생성한 페이지 경계는 천천히 계산하고 재사용
+========================================================= */
+let virtualTxtActive = null;
+let virtualTxtEpoch = 0;
+const virtualTxtLayoutMemory = new Map();
+let virtualTxtPageProbe = null;
+let virtualTxtBackgroundTimer = null;
+let virtualTxtSaveTimer = null;
+
+function isVirtualMobileTxt() {
+  return isMobilePagedReading() && isMobileTxtBook();
+}
+
+function initVirtualTxtCss() {
+  if (document.getElementById('virtualTxtStyle')) return;
+  const style = document.createElement('style');
+  style.id = 'virtualTxtStyle';
+  style.textContent = `
+    @media(max-width:800px) {
+      body.mobile-paged-reading.virtual-txt #txtScrollArea {
+        overflow:hidden !important; scroll-behavior:auto !important;
+      }
+      body.mobile-paged-reading.virtual-txt #txtContent {
+        columns:auto !important; column-width:auto !important;
+        column-count:1 !important; column-gap:normal !important;
+        max-height:100% !important; overflow:hidden !important;
+      }
+    }`;
+  document.head.appendChild(style);
+}
+
+function virtualTxtLayoutSignature() {
+  const size = readMobileViewportSize();
+  const width = Math.max(150, size?.width || window.innerWidth);
+  const height = Math.max(150, size?.height || window.innerHeight);
+  const settings = readerState.settings;
+  // 눈보호 배경/밝기는 페이지 나눔에 영향을 주지 않습니다.
+  return `${Math.round(width)}x${Math.round(height)}:` +
+    `${Number(settings.fontSize)}:${Number(settings.lineHeight)}`;
+}
+
+function virtualTxtKnownPageCount() {
+  const layout = virtualTxtActive;
+  if (!layout) return 1;
+  const ready = Math.max(1, layout.boundaries.length - 1);
+  return layout.complete ? ready : ready + 1;
+}
+
+function virtualTxtApproximatePageCount(layout) {
+  if (!layout) return 1;
+  if (layout.complete) return Math.max(1, layout.boundaries.length - 1);
+  const chapter = txtChapters[layout.chapterIndex]?.content || '';
+  const lengths = [];
+  for (let i = 1; i < Math.min(layout.boundaries.length, 7); i++) {
+    const n = layout.boundaries[i] - layout.boundaries[i-1];
+    if (n > 0) lengths.push(n);
+  }
+  const average = lengths.length
+    ? lengths.reduce((a,b) => a+b, 0) / lengths.length
+    : 450;
+  return Math.max(1, Math.ceil(chapter.length / Math.max(1, average)));
+}
+
+function virtualTxtCurrentOffset() {
+  const layout = virtualTxtActive;
+  if (!layout) return 0;
+  return layout.boundaries[mobilePageState.txtPageIndex] || 0;
+}
+
+function virtualTxtProbe() {
+  if (!virtualTxtPageProbe) {
+    virtualTxtPageProbe = document.createElement('div');
+    virtualTxtPageProbe.id = 'virtualTxtPageProbe';
+    Object.assign(virtualTxtPageProbe.style, {
+      position:'fixed', left:'-10000px', top:'0',
+      zIndex:'-1', visibility:'hidden', pointerEvents:'none',
+      boxSizing:'border-box', height:'auto', maxHeight:'none',
+      overflow:'visible', whiteSpace:'pre-wrap',
+      overflowWrap:'anywhere', wordBreak:'break-word',
+      padding:'22px 0 36px', margin:'0', columnCount:'1',
+      contain:'layout style'
+    });
+    document.body.appendChild(virtualTxtPageProbe);
+  }
+  const css = getComputedStyle(txtContent);
+  const size = readMobileViewportSize();
+  const width = Math.max(120, (size?.width || window.innerWidth) - 32);
+  Object.assign(virtualTxtPageProbe.style, {
+    width: `${width}px`,
+    fontFamily: css.fontFamily,
+    fontSize: `${readerState.settings.fontSize}px`,
+    lineHeight: String(readerState.settings.lineHeight),
+    letterSpacing: css.letterSpacing,
+    fontWeight: css.fontWeight,
+    fontStyle: css.fontStyle,
+    textIndent: css.textIndent,
+    textAlign: css.textAlign
+  });
+  return virtualTxtPageProbe;
+}
+
+// 현재 화면 한 페이지만 계산합니다. 장 전체를 DOM으로 펼치지 않습니다.
+function virtualTxtPaginateOne(layout) {
+  if (!layout || layout.complete) return false;
+  const chapter = txtChapters[layout.chapterIndex]?.content || '';
+  const start = layout.boundaries[layout.boundaries.length - 1] || 0;
+  if (start >= chapter.length) { layout.complete = true; return false; }
+  const probe = virtualTxtProbe();
+  const height = Math.max(180, txtScrollArea.clientHeight || window.innerHeight);
+  const fits = end => {
+    probe.textContent = chapter.slice(start, end);
+    return probe.scrollHeight <= height + 1;
+  };
+  // 대략적인 글자 수 범위에서 적정 페이지 경계를 이진 탐색합니다.
+  let low = Math.min(chapter.length, start + 1);
+  let high = Math.min(chapter.length, start + 800);
+  let budget = 0;
+  while (high < chapter.length && fits(high) && budget++ < 5) {
+    low = high;
+    high = Math.min(chapter.length, start + (high - start) * 2);
+  }
+  if (fits(high)) low = high;
+  else {
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      if (fits(mid)) low = mid;
+      else high = mid - 1;
+    }
+  }
+  // 큰 글씨나 매우 작은 화면에서도 반드시 전진하게 합니다.
+  const end = Math.min(chapter.length, Math.max(start + 1, low));
+  layout.boundaries.push(end);
+  if (end >= chapter.length) layout.complete = true;
+  return true;
+}
+
+function virtualTxtEnsurePage(pageIndex) {
+  const layout = virtualTxtActive;
+  if (!layout || layout.chapterIndex !== currentTxtChapter) return;
+  // 제스처 시작 시 최대 2페이지 앞까지만 즉시 준비합니다.
+  const wanted = Math.max(0, pageIndex) + 1;
+  let count = 0;
+  while (!layout.complete && layout.boundaries.length <= wanted && count++ < 3) {
+    virtualTxtPaginateOne(layout);
+  }
+  mobilePageState.txtPages = virtualTxtKnownPageCount();
+  scheduleVirtualTxtLayoutSave();
+}
+
+function virtualTxtDisplayPage(index, save = true) {
+  const layout = virtualTxtActive;
+  if (!layout) return;
+  virtualTxtEnsurePage(index);
+  const total = Math.max(1, layout.boundaries.length - 1);
+  const page = Math.max(0, Math.min(index, total - 1));
+  mobilePageState.txtPageIndex = page;
+  mobilePageState.txtPages = virtualTxtKnownPageCount();
+  const start = layout.boundaries[page] || 0;
+  const end = layout.boundaries[page + 1] ?? start;
+  const chapter = txtChapters[currentTxtChapter]?.content || '';
+  txtContent.textContent = chapter.slice(start, end);
+  txtScrollArea.scrollLeft = 0;
+  txtScrollArea.scrollTop = 0;
+  mobilePageState.viewportSize = readMobileViewportSize();
+  updateMobileProgressDisplay();
+  if (save) saveVirtualMobileTxtProgress();
+  scheduleVirtualTxtIdlePagination();
+}
+
+function saveVirtualMobileTxtProgress() {
+  if (!selectedBook || !virtualTxtActive) return;
+  const length = Math.max(1, txtChapters[currentTxtChapter]?.content.length || 1);
+  const offset = virtualTxtCurrentOffset();
+  const ratio = offset / length;
+  readerState.txtProgress[selectedBook.id] = {
+    chapterIndex: currentTxtChapter,
+    charOffset: offset,
+    scrollRatio: ratio,
+    pageRatio: ratio
+  };
+  scheduleStateSave();
+}
+
+function virtualTxtCacheKey(bookId, chapterIndex, signature) {
+  return `${bookId}|${chapterIndex}|${signature}|v14`;
+}
+
+async function virtualTxtLoadLayout(bookId, chapterIndex) {
+  const sig = virtualTxtLayoutSignature();
+  const savedVersion = readOfflineBookIndex().find(item => item.id === bookId)?.savedAt || 0;
+  const id = virtualTxtCacheKey(bookId, chapterIndex, `${sig}:${savedVersion}`);
+  let layout = virtualTxtLayoutMemory.get(id);
+  if (!layout) {
+    const cached = await readReaderCacheRecord(TXT_LAYOUT_STORE, id);
+    if (cached?.version === TXT_CACHE_FORMAT_VERSION &&
+        Array.isArray(cached.boundaries) && cached.boundaries[0] === 0) {
+      layout = {id, bookId, chapterIndex, signature:sig,
+        boundaries:cached.boundaries, complete:!!cached.complete};
+    } else {
+      layout = {id, bookId, chapterIndex, signature:sig,
+        boundaries:[0], complete:false};
+    }
+    virtualTxtLayoutMemory.set(id, layout);
+    if (virtualTxtLayoutMemory.size > 14) {
+      const first = virtualTxtLayoutMemory.keys().next().value;
+      virtualTxtLayoutMemory.delete(first);
+    }
+  }
+  return layout;
+}
+
+function scheduleVirtualTxtLayoutSave() {
+  clearTimeout(virtualTxtSaveTimer);
+  virtualTxtSaveTimer = setTimeout(() => {
+    const layout = virtualTxtActive;
+    if (!layout) return;
+    void writeReaderCacheRecord(TXT_LAYOUT_STORE, {
+      id:layout.id, version:TXT_CACHE_FORMAT_VERSION,
+      bookId:layout.bookId, chapterIndex:layout.chapterIndex,
+      boundaries:layout.boundaries.slice(), complete:layout.complete
+    });
+  }, 1600);
+}
+
+function scheduleVirtualTxtIdlePagination() {
+  clearTimeout(virtualTxtBackgroundTimer);
+  const layout = virtualTxtActive;
+  if (!layout || layout.complete || document.hidden || mobilePageState.suspended) return;
+  // 손가락 조작을 최우선으로: 한 번에 한 페이지만 미리 계산합니다.
+  virtualTxtBackgroundTimer = setTimeout(() => {
+    if (document.hidden || mobilePageState.suspended ||
+        virtualTxtActive !== layout || mobilePageState.pageTurning) return;
+    const work = () => {
+      if (document.hidden || mobilePageState.suspended ||
+          virtualTxtActive !== layout || mobilePageState.pageTurning) return;
+      virtualTxtPaginateOne(layout);
+      mobilePageState.txtPages = virtualTxtKnownPageCount();
+      if (layout.complete) {
+        scheduleVirtualTxtLayoutSave();
+        updateMobileProgressDisplay();
+      } else scheduleVirtualTxtIdlePagination();
+    };
+    if ('requestIdleCallback' in window) requestIdleCallback(work, {timeout:2200});
+    else work();
+  }, 850);
+}
+
+async function virtualTxtSeekOffset(offset, requestEpoch = virtualTxtEpoch) {
+  const layout = virtualTxtActive;
+  if (!layout) return;
+  const target = Math.max(0, Math.floor(offset));
+  let sinceYield = 0;
+  while (!layout.complete && layout.boundaries[layout.boundaries.length-1] <= target) {
+    if (requestEpoch !== virtualTxtEpoch || virtualTxtActive !== layout) return;
+    virtualTxtPaginateOne(layout);
+    if (++sinceYield >= 3) {
+      sinceYield = 0;
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  }
+  if (requestEpoch !== virtualTxtEpoch || virtualTxtActive !== layout) return;
+  let low = 0, high = layout.boundaries.length - 2;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (layout.boundaries[mid] <= target) low = mid;
+    else high = mid - 1;
+  }
+  virtualTxtDisplayPage(low, true);
+}
+
+async function activateVirtualTxtChapter(ratio = 0) {
+  if (!isVirtualMobileTxt() || !selectedBook) return;
+  initVirtualTxtCss();
+  document.body.classList.add('virtual-txt');
+  const epoch = ++virtualTxtEpoch;
+  const bookId = selectedBook.id;
+  const chapterIndex = currentTxtChapter;
+  const layout = await virtualTxtLoadLayout(bookId, chapterIndex);
+  if (epoch !== virtualTxtEpoch || selectedBook?.id !== bookId ||
+      currentTxtChapter !== chapterIndex) return;
+  virtualTxtActive = layout;
+  const chapter = txtChapters[chapterIndex]?.content || '';
+  const progress = readerState.txtProgress[bookId] || {};
+  const sameChapter = progress.chapterIndex === chapterIndex;
+  const storedChar = sameChapter && Number.isFinite(progress.charOffset)
+    ? progress.charOffset : chapter.length * Math.max(0, Math.min(1, ratio));
+  // 반복 실행부터는 IDB에 저장된 경계를 활용하여 거의 즉시 복원합니다.
+  virtualTxtEnsurePage(0);
+  await virtualTxtSeekOffset(storedChar, epoch);
+}
+
+async function virtualTxtSeekRatio(ratio) {
+  if (!virtualTxtActive) return;
+  const text = txtChapters[currentTxtChapter]?.content || '';
+  const epoch = ++virtualTxtEpoch;
+  await virtualTxtSeekOffset(text.length * Math.max(0, Math.min(1, ratio)), epoch);
+}
+
+async function virtualTxtCommitPage(direction) {
+  if (!virtualTxtActive) return;
+  const next = mobilePageState.txtPageIndex + direction;
+  virtualTxtEnsurePage(next);
+  const known = Math.max(1, virtualTxtActive.boundaries.length - 1);
+  if (next >= 0 && next < known) {
+    virtualTxtDisplayPage(next, true);
+  } else if (direction > 0 && currentTxtChapter < txtChapters.length - 1) {
+    await moveTxtChapter(currentTxtChapter + 1, 0);
+    await nextMobileAnimationFrame();
+  } else if (direction < 0 && currentTxtChapter > 0) {
+    await moveTxtChapter(currentTxtChapter - 1, 1);
+    await nextMobileAnimationFrame();
+  }
+}
+
+async function virtualTxtRefreshAfterResize() {
+  if (!isVirtualMobileTxt()) return;
+  const old = virtualTxtActive;
+  const charOffset = virtualTxtCurrentOffset();
+  const signature = virtualTxtLayoutSignature();
+  if (old?.signature === signature) {
+    mobilePageState.viewportSize = readMobileViewportSize();
+    return;
+  }
+  const epoch = ++virtualTxtEpoch;
+  const layout = await virtualTxtLoadLayout(selectedBook.id, currentTxtChapter);
+  if (epoch !== virtualTxtEpoch) return;
+  virtualTxtActive = layout;
+  await virtualTxtSeekOffset(charOffset, epoch);
+}
+
+window.addEventListener('pagehide', () => {
+  if (virtualTxtActive) {
+    const layout = virtualTxtActive;
+    void writeReaderCacheRecord(TXT_LAYOUT_STORE, {
+      id:layout.id, version:TXT_CACHE_FORMAT_VERSION,
+      bookId:layout.bookId, chapterIndex:layout.chapterIndex,
+      boundaries:layout.boundaries.slice(), complete:layout.complete
+    });
+  }
+});
+
+/* =========================================================
    v10: 밝기, 오프라인 책 저장, 연결 복구 시 읽던 위치 동기화
    - 로컬에는 OAuth 토큰을 새로 저장하지 않습니다.
    - 책 원본은 IndexedDB에 저장합니다.
@@ -4205,6 +4635,9 @@ document.documentElement.dataset.readerBuild = 'v13-deep-resume';
 
 const OFFLINE_READER_DB = "drive-novel-offline-v1";
 const OFFLINE_READER_STORE = "books";
+const TXT_PARSED_STORE = "txtChapters";
+const TXT_LAYOUT_STORE = "txtLayouts";
+const TXT_CACHE_FORMAT_VERSION = 14;
 const OFFLINE_BOOK_INDEX_KEY = "driveReaderOfflineBookIndexV1";
 const OFFLINE_LOCAL_STATE_KEY = "driveReaderLastLocalStateV1";
 const OFFLINE_PENDING_STATE_KEY = "driveReaderPendingSyncV1";
@@ -4219,10 +4652,12 @@ function openOfflineReaderDb() {
         reject(new Error('이 브라우저는 IndexedDB 오프라인 저장을 지원하지 않습니다.'));
         return;
       }
-      const request = indexedDB.open(OFFLINE_READER_DB, 1);
+      const request = indexedDB.open(OFFLINE_READER_DB, 2);
       request.onupgradeneeded = () => {
-        if (!request.result.objectStoreNames.contains(OFFLINE_READER_STORE)) {
-          request.result.createObjectStore(OFFLINE_READER_STORE, {keyPath:'id'});
+        for (const name of [OFFLINE_READER_STORE, TXT_PARSED_STORE, TXT_LAYOUT_STORE]) {
+          if (!request.result.objectStoreNames.contains(name)) {
+            request.result.createObjectStore(name, {keyPath:'id'});
+          }
         }
       };
       request.onsuccess = () => resolve(request.result);
@@ -4253,6 +4688,38 @@ async function readOfflineBook(fileId) {
   });
 }
 
+async function readReaderCacheRecord(storeName, id) {
+  try {
+    const db = await openOfflineReaderDb();
+    return await new Promise((resolve, reject) => {
+      const request = db.transaction(storeName, 'readonly')
+        .objectStore(storeName).get(id);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error);
+    });
+  } catch (error) {
+    console.warn('리더 캐시 조회 실패:', storeName, error);
+    return null;
+  }
+}
+
+async function writeReaderCacheRecord(storeName, record) {
+  try {
+    const db = await openOfflineReaderDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readwrite');
+      tx.objectStore(storeName).put(record);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+    return true;
+  } catch (error) {
+    console.warn('리더 캐시 저장 실패:', storeName, error);
+    return false;
+  }
+}
+
 function readOfflineBookIndex() {
   try { return JSON.parse(localStorage.getItem(OFFLINE_BOOK_INDEX_KEY) || '[]'); }
   catch { return []; }
@@ -4269,7 +4736,7 @@ function cacheOfflineBookIndex(record) {
 
 const EPUB_RUNTIME_URL =
   'https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js';
-const READER_SHELL_CACHE = 'drive-novel-reader-v13-deep-resume-20261012';
+const READER_SHELL_CACHE = 'drive-novel-reader-v14-txt-page-cache-20261012';
 async function ensureOfflineEpubReaderRuntime() {
   if (!('caches' in window)) {
     throw new Error('EPUB 오프라인 실행 파일을 저장할 수 없는 브라우저입니다.');
@@ -4305,10 +4772,23 @@ async function saveCurrentBookOffline() {
       // EPUB 파일을 읽는 라이브러리도 미리 보관해야 진짜 오프라인 읽기가 됩니다.
       await ensureOfflineEpubReaderRuntime();
     }
+    const savedAt = Date.now();
     await saveOfflineBookRecord({id: originalBookId, name: originalBookName,
       mimeType: originalBookName.toLowerCase().endsWith('.epub') ?
         'application/epub+zip' : 'text/plain',
-      savedAt: Date.now(), blob});
+      savedAt, blob});
+    if (originalBookName.toLowerCase().endsWith('.txt')) {
+      // 최초 다운로드에서 장 분리는 단 한 번 수행하고 결과를 영구 보관합니다.
+      // 다음 실행부터는 거대한 원본 TXT를 다시 읽거나 정규식으로 분리하지 않습니다.
+      const text = await blob.text();
+      const chapters = splitTxtIntoChapters(text);
+      await writeReaderCacheRecord(TXT_PARSED_STORE, {
+        id: originalBookId, savedAt, version: TXT_CACHE_FORMAT_VERSION,
+        chapters
+      });
+      // 같은 파일을 새로 저장했다면 이전 레이아웃은 폐기(원본 변경 가능성).
+      virtualTxtLayoutMemory.clear();
+    }
     cacheOfflineBookIndex({id:originalBookId,name:originalBookName,
       mimeType: originalBookName.toLowerCase().endsWith('.epub') ?
         'application/epub+zip' : 'text/plain'});
