@@ -2918,6 +2918,10 @@ const mobilePageState = {
   viewportSize: null,
   resumeSyncTimer: null,
   resumeLayoutTimer: null,
+  hiddenAt: document.hidden ? Date.now() : 0,
+  lastResumeAt: 0,
+  resumeStabilizeUntil: 0,
+  epubLocationTask: null,
   gestureResetters: new Set(),
   animationFrameWaiters: new Set()
 };
@@ -3085,7 +3089,7 @@ function initializeMobilePagedReading() {
 
   const ui = document.createElement('div');
   ui.id = 'mobileReaderUi';
-  ui.dataset.readerVersion = 'v12-wake-resume';
+  ui.dataset.readerVersion = 'v13-deep-resume';
   ui.setAttribute('aria-label', '휴대폰 독서 메뉴');
   ui.innerHTML = `
     <div class="mobile-reader-top">
@@ -3655,8 +3659,9 @@ async function seekMobileBookProgress(p) {
     try {
       const locations = epubBook?.locations;
       if (!mobilePageState.epubLocationsReady || !locations) {
-        mobilePageState.progressLabel.textContent = 'EPUB 위치 계산 중... 잠시 후 다시 시도하세요';
-        return;
+        mobilePageState.progressLabel.textContent = 'EPUB 위치 계산 중...';
+        const ready = await ensureMobileEpubLocations(epubBook);
+        if (!ready || !isMobilePagedReading()) return;
       }
       const cfi = locations.cfiFromPercentage(target);
       if (cfi) await epubRendition?.display(cfi);
@@ -3980,14 +3985,19 @@ function readMobileViewportSize() {
 function mobileViewportReallyChanged(before, after) {
   if (!before || !after) return true;
   // 화면 시스템 바의 미세한 높이 변화로 전체 페이지를 다시 만들지 않음.
+  // Android는 잠금 해제 직후 시스템 바 높이를 여러 번 바꿉니다.
+  // 너비가 같다면 소규모 높이 변화는 재페이지화하지 않습니다.
   return Math.abs(before.width - after.width) > 3 ||
-    Math.abs(before.height - after.height) > 12;
+    Math.abs(before.height - after.height) > 36;
 }
 
 function scheduleMobileViewportRefresh(delay = 700) {
   if (!isMobilePagedReading()) return;
   clearTimeout(mobilePageState.resizeTimer);
   if (document.hidden || mobilePageState.suspended) return;
+  // 잠금에서 복귀한 직후의 연속 resize 이벤트는 조용해질 때까지 합칩니다.
+  const remaining = Math.max(0,
+    (mobilePageState.resumeStabilizeUntil || 0) - Date.now());
   mobilePageState.resizeTimer = setTimeout(() => {
     mobilePageState.resizeTimer = null;
     if (document.hidden || mobilePageState.suspended || !isMobilePagedReading()) return;
@@ -4008,7 +4018,7 @@ function scheduleMobileViewportRefresh(delay = 700) {
       mobilePageState.viewportSize = readMobileViewportSize();
       updateMobileProgressDisplay();
     }
-  }, delay);
+  }, Math.max(delay, remaining + 250));
 }
 
 function cancelMobileTransientEffects() {
@@ -4055,6 +4065,7 @@ function scheduleDeferredReaderSync(delay = 2600, refreshBooks = false) {
 
 function suspendMobileReader() {
   if (!isMobileReadingLayout()) return;
+  if (!mobilePageState.suspended) mobilePageState.hiddenAt = Date.now();
   mobilePageState.suspended = true;
   cancelMobileTransientEffects();
   clearTimeout(mobilePageState.resumeSyncTimer);
@@ -4066,43 +4077,83 @@ function suspendMobileReader() {
 }
 
 function resumeMobileReader() {
-  if (!isMobileReadingLayout()) return;
+  if (!isMobileReadingLayout() || document.hidden) return;
+  const now = Date.now();
+  // visibilitychange와 pageshow가 연달아 오더라도 복귀 작업은 한 번만.
+  if (!mobilePageState.suspended && now - mobilePageState.lastResumeAt < 1800) return;
+  const asleepMs = mobilePageState.hiddenAt ? now - mobilePageState.hiddenAt : 0;
+  const deepWake = asleepMs >= 45000;
+  mobilePageState.hiddenAt = 0;
+  mobilePageState.lastResumeAt = now;
   mobilePageState.suspended = false;
-  // Android가 깨어날 때의 연속 resize 이벤트가 끝난 뒤 검사.
-  scheduleMobileViewportRefresh(900);
-  // 읽던 페이지는 즉시 보여주고 서버 동기화는 나중에 실행.
-  scheduleDeferredReaderSync();
+
+  // 긴 잠금에서는 Android의 메모리/뷰포트 복원 시간을 확보합니다.
+  // 읽던 페이지는 그대로 보여주고, 재페이지화만 지연시킵니다.
+  mobilePageState.resumeStabilizeUntil = now + (deepWake ? 4800 : 1300);
+  scheduleMobileViewportRefresh(deepWake ? 4850 : 1400);
+
+  // Google Drive 동기화는 정말 저장할 변경사항이 있을 때만 실행합니다.
+  // 책 목록은 이 시점에 갱신하지 않아 불필요한 UI 재구성을 방지합니다.
+  scheduleDeferredReaderSync(deepWake ? 13000 : 4200, false);
 }
 
+/* =========================================================
+   v13 EPUB 위치 인덱스는 요청 시 계산합니다.
+   EPUB 전체 위치 계산은 특히 장시간 화면 잠금 후 재실행될 때
+   수 초간 메인 스레드를 점유할 수 있습니다.
+   일반 독서에서는 가벼운 spine/페이지 기반 진행률을 표시합니다.
+   전체 진행바로 위치 이동을 요청한 경우에만 정밀 인덱스를 준비합니다.
+========================================================= */
 function startMobileEpubLocations(book) {
+  // 자동 전체 계산을 하지 않습니다. 진행바 이동 시 ensure 함수가 준비합니다.
   if (!isMobilePagedReading() || !book) return;
-  book.ready.then(async () => {
+  mobilePageState.epubLocationsReady = false;
+  mobilePageState.epubLocationBook = null;
+  mobilePageState.epubLocationTask = null;
+}
+
+async function ensureMobileEpubLocations(book) {
+  if (!book || epubBook !== book || !book.locations) return false;
+  if (mobilePageState.epubLocationsReady &&
+      mobilePageState.epubLocationBook === book) return true;
+  if (mobilePageState.epubLocationTask) return mobilePageState.epubLocationTask;
+
+  mobilePageState.epubLocationTask = (async () => {
     try {
-      // 로드 중 바로 잠겨도, 백그라운드에서 큰 위치 인덱스를 만들지 않습니다.
-      if (document.hidden) {
+      await book.ready;
+      // 사용자가 탭을 잠근 동안에는 계산을 시작하지 않습니다.
+      while (document.hidden || mobilePageState.suspended) {
         await new Promise(resolve => {
           const ready = () => {
-            if (document.hidden) return;
+            if (document.hidden || mobilePageState.suspended) return;
             document.removeEventListener('visibilitychange', ready);
             resolve();
           };
           document.addEventListener('visibilitychange', ready);
         });
       }
-      if (epubBook !== book) return;
+      if (epubBook !== book) return false;
+      // 화면에 진행 상태가 먼저 표시되게 프레임을 한 번 넘깁니다.
+      await new Promise(resolve => setTimeout(resolve, 60));
+      if (epubBook !== book || document.hidden) return false;
       await book.locations.generate(1500);
-      if (epubBook !== book) return;
+      if (epubBook !== book) return false;
       mobilePageState.epubLocationsReady = true;
       mobilePageState.epubLocationBook = book;
       updateMobileProgressDisplay();
+      return true;
     } catch (error) {
-      console.warn('EPUB 진행 위치 계산 실패', error);
+      console.warn('EPUB 위치 인덱스 계산 실패', error);
+      return false;
+    } finally {
+      mobilePageState.epubLocationTask = null;
     }
-  });
+  })();
+  return mobilePageState.epubLocationTask;
 }
 
 initializeMobilePagedReading();
-document.documentElement.dataset.readerBuild = 'v12-wake-resume';
+document.documentElement.dataset.readerBuild = 'v13-deep-resume';
 
 /* =========================================================
    PWA 설치 및 폴더 관리 스타일
@@ -4129,12 +4180,12 @@ document.documentElement.dataset.readerBuild = 'v12-wake-resume';
   document.head.appendChild(style);
   if ("serviceWorker" in navigator && location.protocol === "https:") {
     window.addEventListener("load", () => {
-      navigator.serviceWorker.register("./sw.js?v=12").then(reg => {
+      navigator.serviceWorker.register("./sw.js?v=13").then(reg => {
         reg.update().catch(() => {});
         // 강제로 캐시를 삭제하지 않고 새 서비스 워커 활성화 후 한 번만 다시 읽습니다.
         navigator.serviceWorker.addEventListener('controllerchange', () => {
-          if (sessionStorage.getItem('reader-v12-updated') !== '1') {
-            sessionStorage.setItem('reader-v12-updated','1');
+          if (sessionStorage.getItem('reader-v13-updated') !== '1') {
+            sessionStorage.setItem('reader-v13-updated','1');
             location.reload();
           }
         });
@@ -4218,7 +4269,7 @@ function cacheOfflineBookIndex(record) {
 
 const EPUB_RUNTIME_URL =
   'https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js';
-const READER_SHELL_CACHE = 'drive-novel-reader-v12-wake-resume-20261012';
+const READER_SHELL_CACHE = 'drive-novel-reader-v13-deep-resume-20261012';
 async function ensureOfflineEpubReaderRuntime() {
   if (!('caches' in window)) {
     throw new Error('EPUB 오프라인 실행 파일을 저장할 수 없는 브라우저입니다.');
@@ -4469,7 +4520,11 @@ async function tryResumeOfflineReaderSync({refreshBooks=true} = {}) {
 window.addEventListener('online', () => {
   updateOfflineSyncStatus('인터넷 연결됨 · 읽던 위치 동기화 대기 중...');
   // Wi-Fi 재연결과 화면 잠금 해제가 겹쳐도 동기화 1회로 묶습니다.
-  scheduleDeferredReaderSync(1800, true);
+  // 잠금 복귀 중 연결이 돌아오면 책 목록 전체를 재로드하지 않습니다.
+  // 읽던 위치 동기화가 필요한 경우에만 낮은 우선순위로 실행합니다.
+  const deepWake = Date.now() < (mobilePageState.resumeStabilizeUntil || 0);
+  scheduleDeferredReaderSync(deepWake ? 13500 : 5200,
+    !cloudReaderStateReady);
 });
 window.addEventListener('offline', () => {
   clearTimeout(mobilePageState.resumeSyncTimer);
