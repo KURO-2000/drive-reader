@@ -2912,7 +2912,14 @@ const mobilePageState = {
   sliderDragging: false,
   resizeTimer: null,
   pageTurning: false,
-  activeDrag: null
+  activeDrag: null,
+  // Android 화면이 꺼져 있는 동안 페이지 작업을 시작하지 않습니다.
+  suspended: document.hidden,
+  viewportSize: null,
+  resumeSyncTimer: null,
+  resumeLayoutTimer: null,
+  gestureResetters: new Set(),
+  animationFrameWaiters: new Set()
 };
 
 function isMobileReadingLayout() {
@@ -3078,7 +3085,7 @@ function initializeMobilePagedReading() {
 
   const ui = document.createElement('div');
   ui.id = 'mobileReaderUi';
-  ui.dataset.readerVersion = 'v11-flip-brightness';
+  ui.dataset.readerVersion = 'v12-wake-resume';
   ui.setAttribute('aria-label', '휴대폰 독서 메뉴');
   ui.innerHTML = `
     <div class="mobile-reader-top">
@@ -3172,26 +3179,15 @@ function initializeMobilePagedReading() {
 
   bindMobilePageGestures(txtScrollArea, document);
   window.addEventListener('resize', () => {
-    if (!isMobilePagedReading()) return;
-    clearTimeout(mobilePageState.resizeTimer);
-    mobilePageState.resizeTimer = setTimeout(() => {
-      if (isMobileTxtBook()) {
-        renderTxtChapter(mobilePageState.txtPages <= 1 ? 0 :
-          mobilePageState.txtPageIndex / (mobilePageState.txtPages - 1));
-      } else {
-        epubRendition?.resize();
-        updateMobileProgressDisplay();
-      }
-    }, 180);
+    // Android에서 잠금 해제 시 주소창/내비게이션 바의 resize 이벤트가
+    // 연속 발생할 수 있습니다. 실제 크기가 달라진 경우에만 재계산합니다.
+    scheduleMobileViewportRefresh();
   });
 }
 
 function prepareMobilePagedBook() {
-  if (mobilePageState.activeDrag?.stage) {
-    mobilePageState.activeDrag.stage.remove();
-  }
-  mobilePageState.activeDrag = null;
-  mobilePageState.pageTurning = false;
+  cancelMobileTransientEffects();
+  mobilePageState.viewportSize = null;
   initializeMobilePagedReading();
   document.body.classList.toggle('mobile-paged-reading', isMobileReadingLayout());
   setMobileReadingControlsVisible(false);
@@ -3234,6 +3230,7 @@ function finishMobileTxtRender(ratio = 0) {
     Math.max(0, Math.round(ratio * (pageCount - 1))));
   txtScrollArea.scrollLeft = mobilePageState.txtPageIndex * getMobileTxtPageStride();
   txtScrollArea.scrollTop = 0;
+  mobilePageState.viewportSize = readMobileViewportSize();
   updateMobileProgressDisplay();
 }
 
@@ -3321,7 +3318,16 @@ function mobilePageMotionEnabled() {
 }
 
 function nextMobileAnimationFrame() {
-  return new Promise(resolve => requestAnimationFrame(resolve));
+  if (document.hidden || mobilePageState.suspended) return Promise.resolve();
+  return new Promise(resolve => {
+    const waiter = {id:0, finish:null};
+    waiter.finish = () => {
+      mobilePageState.animationFrameWaiters.delete(waiter);
+      resolve();
+    };
+    mobilePageState.animationFrameWaiters.add(waiter);
+    waiter.id = requestAnimationFrame(waiter.finish);
+  });
 }
 
 /* =========================================================
@@ -3481,7 +3487,7 @@ function makeMobilePageFlipSnapshot(direction, kind) {
 }
 
 async function animateMobilePageFlip(direction, kind, performTurn) {
-  if (!mobilePageMotionEnabled()) {
+  if (document.hidden || mobilePageState.suspended || !mobilePageMotionEnabled()) {
     await performTurn();
     return;
   }
@@ -3493,6 +3499,8 @@ async function animateMobilePageFlip(direction, kind, performTurn) {
   try {
     await performTurn();
     await nextMobileAnimationFrame();
+    // 화면 잠금 중 취소된 애니메이션을 복귀 시 다시 시작하지 않습니다.
+    if (document.hidden || mobilePageState.suspended || !snapshot.isConnected) return;
     const angle = direction > 0 ? -105 : 105;
     const animation = snapshot._paper.animate([
       {transform:'rotateY(0deg) scaleX(1)', filter:'brightness(1)', offset:0},
@@ -3571,7 +3579,8 @@ async function turnMobileEpubPage(direction) {
 }
 
 function turnMobilePage(direction) {
-  if (!isMobilePagedReading() || mobilePageState.pageTurning) return;
+  if (document.hidden || mobilePageState.suspended ||
+      !isMobilePagedReading() || mobilePageState.pageTurning) return;
   if (!mobileDragCanMove(direction)) return;
 
   // 짧은 터치도 드래그와 완전히 동일한 페이지 무대와
@@ -3765,7 +3774,8 @@ function mobileDragBuildStage(direction) {
 }
 
 function beginMobilePageDrag(gesture, direction) {
-  if (mobilePageState.pageTurning || !mobileDragCanMove(direction)) return false;
+  if (document.hidden || mobilePageState.suspended ||
+      mobilePageState.pageTurning || !mobileDragCanMove(direction)) return false;
   const built = mobileDragBuildStage(direction);
   if (!built) return false;
   mobilePageState.pageTurning = true;
@@ -3866,7 +3876,7 @@ async function finishMobilePageDrag(gesture, commit) {
       mobilePageState.activeDrag = null;
       mobilePageState.pageTurning = false;
     }
-    updateMobileProgressDisplay();
+    if (!document.hidden && !mobilePageState.suspended) updateMobileProgressDisplay();
   }
 }
 
@@ -3885,8 +3895,14 @@ function bindMobilePageGestures(target, ownerDocument) {
     }
   }
   let gesture = null;
+  mobilePageState.gestureResetters.add(() => {
+    if (!gesture) return;
+    try { target.releasePointerCapture?.(gesture.id); } catch (_) {}
+    gesture = null;
+  });
   target.addEventListener('pointerdown', event => {
-    if (!isMobilePagedReading() || mobilePageState.pageTurning ||
+    if (document.hidden || mobilePageState.suspended ||
+        !isMobilePagedReading() || mobilePageState.pageTurning ||
         !event.isPrimary || event.button !== 0 ||
         isReadingControlTarget(event.target)) {
       gesture = null; return;
@@ -3901,6 +3917,7 @@ function bindMobilePageGestures(target, ownerDocument) {
 
   target.addEventListener('pointermove', event => {
     if (!gesture || gesture.id !== event.pointerId ||
+        document.hidden || mobilePageState.suspended ||
         !isMobilePagedReading() || gesture.finishing) return;
     const dx = event.clientX - gesture.x;
     const dy = event.clientY - gesture.y;
@@ -3929,7 +3946,8 @@ function bindMobilePageGestures(target, ownerDocument) {
       void finishMobilePageDrag(current, commit);
       return;
     }
-    if (cancelled || !isMobilePagedReading() || mobilePageState.pageTurning)
+    if (cancelled || document.hidden || mobilePageState.suspended ||
+        !isMobilePagedReading() || mobilePageState.pageTurning)
       return;
     const dx = event.clientX - current.x;
     const dy = event.clientY - current.y;
@@ -3948,10 +3966,130 @@ function bindMobilePageGestures(target, ownerDocument) {
   target.addEventListener('pointercancel', event => onFinish(event,true), {passive:false});
 }
 
+/* =========================================================
+   v12: Android 화면 잠금 / 복귀 최적화
+   잠금 중 렌더링을 중단하고, 돌아올 때 기존 페이지를 먼저 보여줍니다.
+========================================================= */
+
+function readMobileViewportSize() {
+  const target = isMobileTxtBook() ? txtScrollArea : epubViewer;
+  if (!target || !target.isConnected) return null;
+  return {width: target.clientWidth, height: target.clientHeight};
+}
+
+function mobileViewportReallyChanged(before, after) {
+  if (!before || !after) return true;
+  // 화면 시스템 바의 미세한 높이 변화로 전체 페이지를 다시 만들지 않음.
+  return Math.abs(before.width - after.width) > 3 ||
+    Math.abs(before.height - after.height) > 12;
+}
+
+function scheduleMobileViewportRefresh(delay = 700) {
+  if (!isMobilePagedReading()) return;
+  clearTimeout(mobilePageState.resizeTimer);
+  if (document.hidden || mobilePageState.suspended) return;
+  mobilePageState.resizeTimer = setTimeout(() => {
+    mobilePageState.resizeTimer = null;
+    if (document.hidden || mobilePageState.suspended || !isMobilePagedReading()) return;
+    const size = readMobileViewportSize();
+    if (!size?.width || !size?.height) return;
+    if (!mobileViewportReallyChanged(mobilePageState.viewportSize, size)) return;
+    if (mobilePageState.pageTurning) {
+      scheduleMobileViewportRefresh(650);
+      return;
+    }
+    if (isMobileTxtBook()) {
+      // 현재 페이지 비율을 보존하면서 딱 한 번만 페이지 수 재계산.
+      const ratio = mobilePageState.txtPages <= 1 ? 0 :
+        mobilePageState.txtPageIndex / (mobilePageState.txtPages - 1);
+      finishMobileTxtRender(ratio);
+    } else {
+      epubRendition?.resize();
+      mobilePageState.viewportSize = readMobileViewportSize();
+      updateMobileProgressDisplay();
+    }
+  }, delay);
+}
+
+function cancelMobileTransientEffects() {
+  clearTimeout(mobilePageState.resizeTimer);
+  mobilePageState.resizeTimer = null;
+  for (const reset of mobilePageState.gestureResetters) {
+    try { reset(); } catch (_) {}
+  }
+  const drag = mobilePageState.activeDrag;
+  if (drag?.frameId) {
+    cancelAnimationFrame(drag.frameId);
+    drag.frameId = 0;
+  }
+  // 애니메이션 취소는 .finished 대기 Promise를 해제합니다.
+  document.querySelectorAll('.mobile-paper-flip-stage').forEach(stage => {
+    try {
+      for (const animation of stage.getAnimations({subtree:true})) {
+        animation.cancel();
+      }
+    } catch (_) {}
+    stage.remove();
+  });
+  for (const waiter of Array.from(mobilePageState.animationFrameWaiters)) {
+    cancelAnimationFrame(waiter.id);
+    waiter.finish();
+  }
+  mobilePageState.activeDrag = null;
+  mobilePageState.pageTurning = false;
+}
+
+function scheduleDeferredReaderSync(delay = 2600, refreshBooks = false) {
+  clearTimeout(mobilePageState.resumeSyncTimer);
+  mobilePageState.resumeSyncTimer = null;
+  if (document.hidden || !navigator.onLine ||
+      (!refreshBooks && !hasPendingReaderSync())) return;
+  mobilePageState.resumeSyncTimer = setTimeout(() => {
+    mobilePageState.resumeSyncTimer = null;
+    if (document.hidden || !navigator.onLine ||
+        (!refreshBooks && !hasPendingReaderSync())) return;
+    void tryResumeOfflineReaderSync({refreshBooks})
+      .catch(error => console.warn('화면 복귀 동기화 지연', error));
+  }, delay);
+}
+
+function suspendMobileReader() {
+  if (!isMobileReadingLayout()) return;
+  mobilePageState.suspended = true;
+  cancelMobileTransientEffects();
+  clearTimeout(mobilePageState.resumeSyncTimer);
+  mobilePageState.resumeSyncTimer = null;
+  // 이미 계산된 독서 화면을 버리지 않고 로컬에 마지막 상태만 남깁니다.
+  try {
+    localStorage.setItem(OFFLINE_LOCAL_STATE_KEY, JSON.stringify(readerState));
+  } catch (_) {}
+}
+
+function resumeMobileReader() {
+  if (!isMobileReadingLayout()) return;
+  mobilePageState.suspended = false;
+  // Android가 깨어날 때의 연속 resize 이벤트가 끝난 뒤 검사.
+  scheduleMobileViewportRefresh(900);
+  // 읽던 페이지는 즉시 보여주고 서버 동기화는 나중에 실행.
+  scheduleDeferredReaderSync();
+}
+
 function startMobileEpubLocations(book) {
   if (!isMobilePagedReading() || !book) return;
   book.ready.then(async () => {
     try {
+      // 로드 중 바로 잠겨도, 백그라운드에서 큰 위치 인덱스를 만들지 않습니다.
+      if (document.hidden) {
+        await new Promise(resolve => {
+          const ready = () => {
+            if (document.hidden) return;
+            document.removeEventListener('visibilitychange', ready);
+            resolve();
+          };
+          document.addEventListener('visibilitychange', ready);
+        });
+      }
+      if (epubBook !== book) return;
       await book.locations.generate(1500);
       if (epubBook !== book) return;
       mobilePageState.epubLocationsReady = true;
@@ -3964,7 +4102,7 @@ function startMobileEpubLocations(book) {
 }
 
 initializeMobilePagedReading();
-document.documentElement.dataset.readerBuild = 'v11-flip-brightness';
+document.documentElement.dataset.readerBuild = 'v12-wake-resume';
 
 /* =========================================================
    PWA 설치 및 폴더 관리 스타일
@@ -3991,12 +4129,12 @@ document.documentElement.dataset.readerBuild = 'v11-flip-brightness';
   document.head.appendChild(style);
   if ("serviceWorker" in navigator && location.protocol === "https:") {
     window.addEventListener("load", () => {
-      navigator.serviceWorker.register("./sw.js?v=10").then(reg => {
+      navigator.serviceWorker.register("./sw.js?v=12").then(reg => {
         reg.update().catch(() => {});
         // 강제로 캐시를 삭제하지 않고 새 서비스 워커 활성화 후 한 번만 다시 읽습니다.
         navigator.serviceWorker.addEventListener('controllerchange', () => {
-          if (sessionStorage.getItem('reader-v10-updated') !== '1') {
-            sessionStorage.setItem('reader-v10-updated','1');
+          if (sessionStorage.getItem('reader-v12-updated') !== '1') {
+            sessionStorage.setItem('reader-v12-updated','1');
             location.reload();
           }
         });
@@ -4080,7 +4218,7 @@ function cacheOfflineBookIndex(record) {
 
 const EPUB_RUNTIME_URL =
   'https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js';
-const READER_SHELL_CACHE = 'drive-novel-reader-v11-flip-brightness-20261012';
+const READER_SHELL_CACHE = 'drive-novel-reader-v12-wake-resume-20261012';
 async function ensureOfflineEpubReaderRuntime() {
   if (!('caches' in window)) {
     throw new Error('EPUB 오프라인 실행 파일을 저장할 수 없는 브라우저입니다.');
@@ -4304,8 +4442,8 @@ function applyReaderBrightness() {
   );
 }
 
-async function tryResumeOfflineReaderSync() {
-  if (!navigator.onLine) return;
+async function tryResumeOfflineReaderSync({refreshBooks=true} = {}) {
+  if (!navigator.onLine || document.hidden) return;
   if (window.google?.accounts?.oauth2 && !tokenClient) initGoogle();
   if (!tokenClient) {
     // 오프라인 시작 때 원격 Google 스크립트가 로드되지 않았을 수 있습니다.
@@ -4321,7 +4459,7 @@ async function tryResumeOfflineReaderSync() {
   }
   if (cloudReaderStateReady && accessToken) {
     if (hasPendingReaderSync()) await saveState();
-    if (libraryFolderId) await loadBooks();
+    if (refreshBooks && libraryFolderId) await loadBooks();
     return;
   }
   if (localStorage.getItem(GOOGLE_CONNECTED_KEY) === '1') {
@@ -4329,16 +4467,23 @@ async function tryResumeOfflineReaderSync() {
   }
 }
 window.addEventListener('online', () => {
-  updateOfflineSyncStatus('인터넷 연결됨 · 읽던 위치 동기화 시도 중...');
-  void tryResumeOfflineReaderSync().catch(error => console.warn('재연결 대기',error));
+  updateOfflineSyncStatus('인터넷 연결됨 · 읽던 위치 동기화 대기 중...');
+  // Wi-Fi 재연결과 화면 잠금 해제가 겹쳐도 동기화 1회로 묶습니다.
+  scheduleDeferredReaderSync(1800, true);
 });
 window.addEventListener('offline', () => {
+  clearTimeout(mobilePageState.resumeSyncTimer);
+  mobilePageState.resumeSyncTimer = null;
   updateOfflineSyncStatus('오프라인 · 읽던 위치 기기에 저장됨');
   renderOfflineOnlyBookList();
 });
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && navigator.onLine && hasPendingReaderSync()) {
-    void tryResumeOfflineReaderSync().catch(() => {});
-  }
+  if (document.hidden) suspendMobileReader();
+  else if (isMobileReadingLayout()) resumeMobileReader();
+  else scheduleDeferredReaderSync();
+});
+window.addEventListener('pagehide', suspendMobileReader);
+window.addEventListener('pageshow', () => {
+  if (!document.hidden && isMobileReadingLayout()) resumeMobileReader();
 });
 window.addEventListener('load', () => initializeReaderBrightness());
