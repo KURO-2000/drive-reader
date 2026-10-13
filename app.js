@@ -2979,6 +2979,11 @@ function initializeMobilePagedReading() {
   const style = document.createElement('style');
   style.id = 'mobilePagedReaderStyle';
   style.textContent = `
+    /* 모바일 메뉴는 PC 및 태블릿 너비에서 반드시 숨깁니다. */
+    #mobileReaderUi { display:none; }
+    @media (min-width:801px) {
+      #mobileReaderUi { display:none !important; }
+    }
     @media (max-width:800px) {
       body.mobile-paged-reading { overflow:hidden !important; }
       body.mobile-paged-reading .mobile-header,
@@ -3113,7 +3118,7 @@ function initializeMobilePagedReading() {
 
   const ui = document.createElement('div');
   ui.id = 'mobileReaderUi';
-  ui.dataset.readerVersion = 'v14-txt-page-cache';
+  ui.dataset.readerVersion = 'v14.1-mobile-ui-only';
   ui.setAttribute('aria-label', '휴대폰 독서 메뉴');
   ui.innerHTML = `
     <div class="mobile-reader-top">
