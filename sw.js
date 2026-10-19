@@ -1,5 +1,5 @@
 /* v10: PWA 앱 화면과 EPUB 엔진을 오프라인에서 실행하도록 보관합니다. */
-const CACHE_NAME = 'drive-novel-reader-v16-cloud-priority-20261019';
+const CACHE_NAME = 'drive-novel-reader-v17-trusted-progress-20261019';
 const EPUB_RUNTIME_URL = 'https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js';
 const APP_SHELL = [
   './', './index.html', './style.css', './app.js',
@@ -46,7 +46,15 @@ self.addEventListener('fetch', event => {
     return;
   }
   if (url.origin !== self.location.origin) return;
+  const shellPaths = APP_SHELL.map(file => new URL(file, self.registration.scope).pathname);
+  const isShell = request.mode === 'navigate' || shellPaths.includes(url.pathname);
   event.respondWith((async () => {
+    if (isShell) {
+      // 앱 실행 경로와 JS/CSS는 캐시 우선. 새 버전은 SW install 때 캐시가 교체됩니다.
+      const cached = await caches.match(request, {ignoreSearch:true}) ||
+        (request.mode === 'navigate' ? await caches.match('./index.html') : null);
+      if (cached) return cached;
+    }
     try {
       const response = await fetch(request);
       if (response.ok) {
@@ -57,7 +65,6 @@ self.addEventListener('fetch', event => {
     } catch (error) {
       const cached = await caches.match(request, {ignoreSearch:true});
       if (cached) return cached;
-      // 오프라인에서 앱 URL의 쿼리가 달라도 진입 가능하게 합니다.
       if (request.mode === 'navigate') {
         const home = await caches.match('./index.html');
         if (home) return home;
