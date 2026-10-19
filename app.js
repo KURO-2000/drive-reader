@@ -1933,6 +1933,8 @@ async function openEpubBook(
       }
 
 
+      if (readerCloudApplyInProgress) return;
+
       readerState
         .epubProgress[
           book.id
@@ -2389,124 +2391,134 @@ function scheduleStateSave() {
    appData 상태 읽기
 ========================================================= */
 
-async function loadState() {
+/* =========================================================
+   v15: 다른 기기 읽던 위치 동기화
+   - 저장된 책/페이지를 다시 다운로드하지 않고 상태 JSON만 조회
+   - 실질적인 페이지 이동만 업로드 대상으로 기록
+   - 읽기 위치 변경 시각을 비교해서 이전 기기 정보로 덮어쓰지 않음
+========================================================= */
 
-  try {
+let readerStateRefreshInFlight = null;
+let lastReaderCloudCheckAt = 0;
+let readerProgressMutationCounter = 0;
+let readerCloudApplyInProgress = false;
 
-    const query =
-      encodeURIComponent(
+function normalizeReaderCloudState(parsed = {}) {
+  return {
+    settings: {
+      theme: parsed.settings?.theme || "sepia",
+      fontSize: parsed.settings?.fontSize || 20,
+      lineHeight: parsed.settings?.lineHeight || 1.9,
+      contentWidth: parsed.settings?.contentWidth || 850,
+      brightness: Math.max(20, Math.min(100,
+        Number(parsed.settings?.brightness ?? 100)))
+    },
+    lastOpenedBookId: parsed.lastOpenedBookId || null,
+    txtProgress: parsed.txtProgress || {},
+    epubProgress: parsed.epubProgress || {}
+  };
+}
 
-        `name='${STATE_FILE_NAME}' and trashed=false`
+function comparableBookPosition(position) {
+  if (!position) return null;
+  // 'updatedAt'은 비교에서 제외하여 동일 위치를 재저장하지 않습니다.
+  const {updatedAt, ...fields} = position;
+  return fields;
+}
 
-      );
+function isSameBookPosition(a, b) {
+  return JSON.stringify(comparableBookPosition(a)) ===
+    JSON.stringify(comparableBookPosition(b));
+}
 
+function hasPendingProgressForBook(bookId) {
+  const pending = getPendingReaderSync();
+  return !!(pending?.schemaVersion === 2 && pending.bookIds?.[bookId]);
+}
 
-    const response =
-      await apiFetch(
+async function applyLatestCloudPositionToOpenBook(previous, bookId) {
+  if (!bookId || selectedBook?.id !== bookId ||
+      hasPendingProgressForBook(bookId)) return;
+  const current = selectedBook.name.toLowerCase().endsWith('.txt')
+    ? readerState.txtProgress?.[bookId]
+    : readerState.epubProgress?.[bookId];
+  if (!current || isSameBookPosition(previous, current)) return;
 
-        "https://www.googleapis.com/drive/v3/files" +
-        "?spaces=appDataFolder" +
-        `&q=${query}` +
-        "&fields=files(id,name)"
+  if (selectedBook.name.toLowerCase().endsWith('.txt')) {
+    if (!txtChapters?.length) return;
+    const chapter = Math.max(0, Math.min(txtChapters.length - 1,
+      Number(current.chapterIndex) || 0));
+    const ratio = Math.max(0, Math.min(1,
+      Number(current.pageRatio ?? current.scrollRatio ?? 0)));
+    readerCloudApplyInProgress = true;
+    try {
+      currentTxtChapter = chapter;
+      renderTxtChapter(ratio);
+      updateMobileProgressDisplay();
+    } finally {
+      // requestAnimationFrame에서 페이지 복원이 완료되는 동안 저장 추적 방지
+      setTimeout(() => { readerCloudApplyInProgress = false; }, 1200);
+    }
+  } else if (epubRendition && current.cfi) {
+    readerCloudApplyInProgress = true;
+    try { await epubRendition.display(current.cfi); }
+    catch (error) { console.warn('EPUB 최신 위치 적용 실패', error); }
+    finally { readerCloudApplyInProgress = false; }
+  }
+  updateOfflineSyncStatus('다른 기기에서 읽던 위치를 불러왔습니다.');
+}
 
-      );
+async function refreshReaderStateFromDrive({applyToOpenedBook = true} = {}) {
+  if (!navigator.onLine || !accessToken) return false;
+  if (readerStateRefreshInFlight) return readerStateRefreshInFlight;
 
-
-    const data =
-      await response.json();
-
-
-    if (
-      !data.files ||
-      data.files.length === 0
-    ) {
-
-      stateFileId = "";
+  readerStateRefreshInFlight = (async () => {
+    const activeId = selectedBook?.id || null;
+    const wasTxt = !!selectedBook?.name?.toLowerCase().endsWith('.txt');
+    const previous = activeId ? structuredClone(
+      wasTxt ? readerState.txtProgress?.[activeId] || null :
+        readerState.epubProgress?.[activeId] || null) : null;
+    const startMutation = readerProgressMutationCounter;
+    try {
+      if (!stateFileId) {
+        const query = encodeURIComponent(
+          `name='${STATE_FILE_NAME}' and trashed=false`);
+        const response = await apiFetch(
+          'https://www.googleapis.com/drive/v3/files' +
+          '?spaces=appDataFolder' + `&q=${query}` + '&fields=files(id,name)');
+        const found = await response.json();
+        stateFileId = found.files?.[0]?.id || '';
+      }
+      let remote = {};
+      if (stateFileId) {
+        const response = await apiFetch(
+          `https://www.googleapis.com/drive/v3/files/${stateFileId}?alt=media`);
+        remote = JSON.parse(await response.text());
+      }
+      readerState = normalizeReaderCloudState(remote);
       cloudReaderStateReady = true;
       applyPendingReaderState();
-      return;
-
+      lastReaderCloudCheckAt = Date.now();
+      // 사용자가 네트워크 요청 중 페이지를 넘겼다면 화면을 자동 이동하지 않습니다.
+      if (applyToOpenedBook && activeId && selectedBook?.id === activeId &&
+          startMutation === readerProgressMutationCounter &&
+          !document.hidden && !mobilePageState.pageTurning &&
+          !mobilePageState.activeDrag) {
+        await applyLatestCloudPositionToOpenBook(previous, activeId);
+      }
+      return true;
+    } catch (error) {
+      console.warn('다른 기기 읽던 위치 확인 실패', error);
+      if (!cloudReaderStateReady) restoreLocalReaderState();
+      return false;
     }
+  })();
+  try { return await readerStateRefreshInFlight; }
+  finally { readerStateRefreshInFlight = null; }
+}
 
-
-    stateFileId =
-      data.files[0].id;
-
-
-    const stateResponse =
-      await apiFetch(
-
-        `https://www.googleapis.com/drive/v3/files/${stateFileId}?alt=media`
-
-      );
-
-
-    const text =
-      await stateResponse.text();
-
-
-    const parsed =
-      JSON.parse(text);
-
-
-    readerState = {
-
-      settings: {
-
-        theme:
-          parsed.settings
-            ?.theme ||
-          "sepia",
-
-        fontSize:
-          parsed.settings
-            ?.fontSize ||
-          20,
-
-        lineHeight:
-          parsed.settings
-            ?.lineHeight ||
-          1.9,
-
-        contentWidth:
-          parsed.settings
-            ?.contentWidth ||
-          850,
-
-        brightness: Math.max(20, Math.min(100,
-          Number(parsed.settings?.brightness ?? 100)))
-
-      },
-
-      lastOpenedBookId:
-        parsed.lastOpenedBookId ||
-        null,
-
-      txtProgress:
-        parsed.txtProgress ||
-        {},
-
-      epubProgress:
-        parsed.epubProgress ||
-        {}
-
-    };
-
-    cloudReaderStateReady = true;
-    applyPendingReaderState();
-
-  }
-
-  catch (error) {
-    cloudReaderStateReady = false;
-    restoreLocalReaderState();
-    console.error(
-      "상태 불러오기 실패",
-      error
-    );
-
-  }
-
+async function loadState() {
+  await refreshReaderStateFromDrive();
 }
 
 
@@ -2522,6 +2534,9 @@ async function saveState() {
   if (readerStateUploadInFlight) return readerStateUploadInFlight;
 
   readerStateUploadInFlight = (async () => {
+    // 최신 Drive 데이터를 병합한 뒤 현재 기기에서 실제 변경한 책만 우선 적용합니다.
+    const refreshed = await refreshReaderStateFromDrive({applyToOpenedBook: false});
+    if (!refreshed || !hasPendingReaderSync()) return false;
     const pendingVersion = getPendingReaderSync()?.version;
     const snapshot = JSON.parse(JSON.stringify(readerState));
     try {
@@ -4141,12 +4156,10 @@ function cancelMobileTransientEffects() {
 function scheduleDeferredReaderSync(delay = 2600, refreshBooks = false) {
   clearTimeout(mobilePageState.resumeSyncTimer);
   mobilePageState.resumeSyncTimer = null;
-  if (document.hidden || !navigator.onLine ||
-      (!refreshBooks && !hasPendingReaderSync())) return;
+  if (document.hidden || !navigator.onLine) return;
   mobilePageState.resumeSyncTimer = setTimeout(() => {
     mobilePageState.resumeSyncTimer = null;
-    if (document.hidden || !navigator.onLine ||
-        (!refreshBooks && !hasPendingReaderSync())) return;
+    if (document.hidden || !navigator.onLine) return;
     void tryResumeOfflineReaderSync({refreshBooks})
       .catch(error => console.warn('화면 복귀 동기화 지연', error));
   }, delay);
@@ -4183,7 +4196,7 @@ function resumeMobileReader() {
 
   // Google Drive 동기화는 정말 저장할 변경사항이 있을 때만 실행합니다.
   // 책 목록은 이 시점에 갱신하지 않아 불필요한 UI 재구성을 방지합니다.
-  scheduleDeferredReaderSync(deepWake ? 13000 : 4200, false);
+  scheduleDeferredReaderSync(deepWake ? 5600 : 2400, false);
 }
 
 /* =========================================================
@@ -4537,7 +4550,7 @@ function scheduleVirtualTxtIdlePagination() {
   }, 850);
 }
 
-async function virtualTxtSeekOffset(offset, requestEpoch = virtualTxtEpoch) {
+async function virtualTxtSeekOffset(offset, requestEpoch = virtualTxtEpoch, shouldSave = true) {
   const layout = virtualTxtActive;
   if (!layout) return;
   const target = Math.max(0, Math.floor(offset));
@@ -4557,7 +4570,7 @@ async function virtualTxtSeekOffset(offset, requestEpoch = virtualTxtEpoch) {
     if (layout.boundaries[mid] <= target) low = mid;
     else high = mid - 1;
   }
-  virtualTxtDisplayPage(low, true);
+  virtualTxtDisplayPage(low, shouldSave);
 }
 
 async function activateVirtualTxtChapter(ratio = 0) {
@@ -4578,7 +4591,7 @@ async function activateVirtualTxtChapter(ratio = 0) {
     ? progress.charOffset : chapter.length * Math.max(0, Math.min(1, ratio));
   // 반복 실행부터는 IDB에 저장된 경계를 활용하여 거의 즉시 복원합니다.
   virtualTxtEnsurePage(0);
-  await virtualTxtSeekOffset(storedChar, epoch);
+  await virtualTxtSeekOffset(storedChar, epoch, false);
 }
 
 async function virtualTxtSeekRatio(ratio) {
@@ -4741,7 +4754,7 @@ function cacheOfflineBookIndex(record) {
 
 const EPUB_RUNTIME_URL =
   'https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js';
-const READER_SHELL_CACHE = 'drive-novel-reader-v14-txt-page-cache-20261012';
+const READER_SHELL_CACHE = 'drive-novel-reader-v15-cross-device-sync-20261019';
 async function ensureOfflineEpubReaderRuntime() {
   if (!('caches' in window)) {
     throw new Error('EPUB 오프라인 실행 파일을 저장할 수 없는 브라우저입니다.');
@@ -4873,18 +4886,52 @@ function getPendingReaderSync() {
   try { return JSON.parse(localStorage.getItem(OFFLINE_PENDING_STATE_KEY) || 'null'); }
   catch { return null; }
 }
-function hasPendingReaderSync() { return !!getPendingReaderSync(); }
+function hasPendingReaderSync() {
+  const p = getPendingReaderSync();
+  return !!(p?.schemaVersion === 2 &&
+    (Object.keys(p.bookIds || {}).length || p.settingsChanged || p.lastOpenedChanged));
+}
 function persistPendingReaderState() {
   try {
+    const previous = JSON.parse(localStorage.getItem(OFFLINE_LOCAL_STATE_KEY) || 'null');
+    const existing = getPendingReaderSync();
+    const pending = existing?.schemaVersion === 2 ? existing :
+      {schemaVersion:2,bookIds:{},settingsChanged:false,lastOpenedChanged:false};
+    let changed = false;
+    const now = Date.now();
+
+    for (const type of ['txtProgress', 'epubProgress']) {
+      for (const [bookId, position] of Object.entries(readerState[type] || {})) {
+        if (!isSameBookPosition(previous?.[type]?.[bookId], position)) {
+          const stamp = Math.max(now, Number(position.updatedAt || 0) + 1);
+          position.updatedAt = stamp;
+          pending.bookIds[bookId] = stamp;
+          readerProgressMutationCounter++;
+          changed = true;
+        }
+      }
+    }
+    if (previous && JSON.stringify(previous.settings) !==
+        JSON.stringify(readerState.settings)) {
+      pending.settingsChanged = true;
+      changed = true;
+    }
+    if (previous && previous.lastOpenedBookId !== readerState.lastOpenedBookId) {
+      pending.lastOpenedChanged = true;
+      changed = true;
+    }
+
+    // 처음 복원한 데이터 자체는 새로 읽은 위치가 아닙니다.
     localStorage.setItem(OFFLINE_LOCAL_STATE_KEY, JSON.stringify(readerState));
-    const previous = getPendingReaderSync();
-    const touched = {...(previous?.bookIds || {})};
-    if (selectedBook?.id) touched[selectedBook.id] = Date.now();
-    localStorage.setItem(OFFLINE_PENDING_STATE_KEY,
-      JSON.stringify({version: Date.now() + Math.random(), bookIds:touched,
-        lastOpenedBookId: readerState.lastOpenedBookId,
-        settings:readerState.settings, state:readerState}));
-    if (!navigator.onLine) updateOfflineSyncStatus('오프라인 · 읽던 위치 기기에 저장됨');
+    if (changed && !readerCloudApplyInProgress) {
+      pending.version = now + Math.random();
+      pending.lastOpenedBookId = readerState.lastOpenedBookId;
+      pending.settings = readerState.settings;
+      pending.state = JSON.parse(JSON.stringify(readerState));
+      localStorage.setItem(OFFLINE_PENDING_STATE_KEY, JSON.stringify(pending));
+      if (!navigator.onLine)
+        updateOfflineSyncStatus('오프라인 · 읽던 위치 기기에 저장됨');
+    }
   } catch (error) { console.warn('기기 읽기 위치 저장 실패', error); }
 }
 function restoreLocalReaderState() {
@@ -4900,15 +4947,69 @@ function restoreLocalReaderState() {
   } catch (error) { console.warn('기기 위치 복원 실패', error); }
 }
 function applyPendingReaderState() {
-  const pending = getPendingReaderSync();
+  let pending = getPendingReaderSync();
+  if (pending && pending.schemaVersion !== 2) {
+    // v14는 책을 '열기만 해도' 업로드 대상으로 표시하는 문제가 있었습니다.
+    // 10장보다 Drive의 15장이 앞서 있다면 Drive를 사용합니다.
+    // 단, 오프라인에서 18장까지 읽었는데 Drive가 15장이면 로컬을 보존합니다.
+    try {
+      localStorage.setItem('driveReaderV14PendingBackup', JSON.stringify(pending));
+      const migrated = {schemaVersion:2,bookIds:{},settingsChanged:false,
+        lastOpenedChanged:false,state:pending.state};
+      const legacy = pending.state || {};
+      for (const [id, time] of Object.entries(pending.bookIds || {})) {
+        const localPosition = legacy.txtProgress?.[id] || legacy.epubProgress?.[id];
+        const cloudPosition = readerState.txtProgress?.[id] || readerState.epubProgress?.[id];
+        if (!localPosition) continue;
+        let shouldKeep = !cloudPosition;
+        if (localPosition.chapterIndex != null && cloudPosition?.chapterIndex != null) {
+          shouldKeep = Number(localPosition.chapterIndex) > Number(cloudPosition.chapterIndex) ||
+            (Number(localPosition.chapterIndex) === Number(cloudPosition.chapterIndex) &&
+             Number(localPosition.charOffset ?? localPosition.pageRatio ?? localPosition.scrollRatio ?? 0) >
+             Number(cloudPosition.charOffset ?? cloudPosition.pageRatio ?? cloudPosition.scrollRatio ?? 0));
+        }
+        if (Number(localPosition.updatedAt || 0) > Number(cloudPosition?.updatedAt || 0))
+          shouldKeep = true;
+        if (shouldKeep) migrated.bookIds[id] = Math.max(Number(time || 0),
+          Number(localPosition.updatedAt || 0));
+      }
+      if (Object.keys(migrated.bookIds).length) {
+        migrated.version = Date.now();
+        localStorage.setItem(OFFLINE_PENDING_STATE_KEY, JSON.stringify(migrated));
+        pending = migrated;
+      } else {
+        localStorage.removeItem(OFFLINE_PENDING_STATE_KEY);
+        pending = null;
+      }
+    } catch (_) { pending = null; }
+  }
   if (pending?.state) {
     const local = pending.state;
-    for (const id of Object.keys(pending.bookIds || {})) {
+    for (const [id, touchedAt] of Object.entries(pending.bookIds || {})) {
+      const remoteTxt = readerState.txtProgress?.[id];
+      const remoteEpub = readerState.epubProgress?.[id];
+      const remoteTimestamp = Math.max(Number(remoteTxt?.updatedAt || 0),
+        Number(remoteEpub?.updatedAt || 0));
+      // 원격에서 나중에 읽었다면 오래된 기기 위치를 절대 덮어쓰지 않습니다.
+      if (remoteTimestamp > Number(touchedAt)) {
+        delete pending.bookIds[id];
+        continue;
+      }
       if (local.txtProgress?.[id]) readerState.txtProgress[id] = local.txtProgress[id];
       if (local.epubProgress?.[id]) readerState.epubProgress[id] = local.epubProgress[id];
     }
-    readerState.settings = {...readerState.settings, ...(pending.settings || {})};
-    if (pending.lastOpenedBookId) readerState.lastOpenedBookId = pending.lastOpenedBookId;
+    if (pending.settingsChanged)
+      readerState.settings = {...readerState.settings, ...(pending.settings || {})};
+    if (pending.lastOpenedChanged && pending.lastOpenedBookId)
+      readerState.lastOpenedBookId = pending.lastOpenedBookId;
+
+    if (!Object.keys(pending.bookIds || {}).length && !pending.settingsChanged &&
+        !pending.lastOpenedChanged) {
+      localStorage.removeItem(OFFLINE_PENDING_STATE_KEY);
+    } else {
+      pending.state = JSON.parse(JSON.stringify(readerState));
+      localStorage.setItem(OFFLINE_PENDING_STATE_KEY, JSON.stringify(pending));
+    }
   }
   try { localStorage.setItem(OFFLINE_LOCAL_STATE_KEY, JSON.stringify(readerState)); }
   catch (error) { console.warn('로컬 병합 저장 실패', error); }
@@ -4994,6 +5095,7 @@ async function tryResumeOfflineReaderSync({refreshBooks=true} = {}) {
     return;
   }
   if (cloudReaderStateReady && accessToken) {
+    await refreshReaderStateFromDrive();
     if (hasPendingReaderSync()) await saveState();
     if (refreshBooks && libraryFolderId) await loadBooks();
     return;
@@ -5002,13 +5104,21 @@ async function tryResumeOfflineReaderSync({refreshBooks=true} = {}) {
     await autoReconnectGoogleDrive();
   }
 }
+// 앱으로 복귀했을 때, 로컬에 변경사항이 없어도 PC의 최신 위치를 가져옵니다.
+// 갱신 간격을 제한하여 잦은 탭 전환/화면 잠금 해제 시 호출을 합칩니다.
+window.addEventListener('focus', () => {
+  if (document.hidden || !navigator.onLine || !accessToken) return;
+  if (Date.now() - lastReaderCloudCheckAt > 15000)
+    scheduleDeferredReaderSync(isMobileReadingLayout() ? 4800 : 1300, false);
+});
+
 window.addEventListener('online', () => {
   updateOfflineSyncStatus('인터넷 연결됨 · 읽던 위치 동기화 대기 중...');
   // Wi-Fi 재연결과 화면 잠금 해제가 겹쳐도 동기화 1회로 묶습니다.
   // 잠금 복귀 중 연결이 돌아오면 책 목록 전체를 재로드하지 않습니다.
   // 읽던 위치 동기화가 필요한 경우에만 낮은 우선순위로 실행합니다.
   const deepWake = Date.now() < (mobilePageState.resumeStabilizeUntil || 0);
-  scheduleDeferredReaderSync(deepWake ? 13500 : 5200,
+  scheduleDeferredReaderSync(deepWake ? 5800 : 2500,
     !cloudReaderStateReady);
 });
 window.addEventListener('offline', () => {
@@ -5026,4 +5136,38 @@ window.addEventListener('pagehide', suspendMobileReader);
 window.addEventListener('pageshow', () => {
   if (!document.hidden && isMobileReadingLayout()) resumeMobileReader();
 });
+function initializeManualReaderSyncButton() {
+  if (!settingsPanel || document.getElementById('readerSyncNowBtn')) return;
+  const button = document.createElement('button');
+  button.id = 'readerSyncNowBtn';
+  button.type = 'button';
+  button.textContent = '⟳ 다른 기기 읽던 위치 불러오기';
+  button.style.cssText = 'display:block;width:100%;padding:12px;margin:12px 0;' +
+    'border:1px solid #999;border-radius:8px;background:transparent;color:inherit;';
+  button.addEventListener('click', async () => {
+    if (!navigator.onLine) {
+      alert('인터넷 연결이 필요합니다. 오프라인에서 읽던 위치는 보관 중입니다.');
+      return;
+    }
+    if (!accessToken) {
+      alert('Google Drive 연결 후 다시 눌러 주세요.');
+      return;
+    }
+    button.disabled = true;
+    button.textContent = 'Drive 읽던 위치 확인 중...';
+    try {
+      const ok = await refreshReaderStateFromDrive();
+      if (ok) {
+        // 서버에 더 새로운 위치가 없더라도 상태를 확인했다는 사실을 알립니다.
+        applySettings();
+        alert('Google Drive 읽던 위치 확인을 마쳤습니다.');
+      } else alert('Google Drive 위치를 불러오지 못했습니다. 다시 시도해 주세요.');
+    } finally {
+      button.textContent = '⟳ 다른 기기 읽던 위치 불러오기';
+      button.disabled = false;
+    }
+  });
+  settingsPanel.appendChild(button);
+}
+window.addEventListener('load', () => initializeManualReaderSyncButton());
 window.addEventListener('load', () => initializeReaderBrightness());
