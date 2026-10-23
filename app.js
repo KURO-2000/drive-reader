@@ -1300,6 +1300,8 @@ async function multipartUpload(
 
 async function openBook(book) {
 
+  // 사이드바나 오프라인 목록에서 직접 연 책도 Android 뒤로가기를 보장합니다.
+  if (isMobileReaderDevice()) registerMobileReadingBackEntry();
   if (mobileShelfIsOpen) hideMobileBookshelf();
 
   selectedBook =
@@ -5462,7 +5464,7 @@ window.addEventListener('load', () => initializeReaderBrightness());
    - 책 원본은 기존 IndexedDB 오프라인 캐시 재사용
 ========================================================= */
 
-const MOBILE_SHELF_VERSION = 'v21-drive-trash-20261023';
+const MOBILE_SHELF_VERSION = 'v22-android-reader-back-20261023';
 const MOBILE_SHELF_CACHE_PREFIX = 'driveReaderShelfFolder-v20-';
 let mobileShelfRoot = null;
 let mobileShelfIsOpen = false;
@@ -5701,10 +5703,13 @@ function createMobileBookshelf() {
   byId('shelfBottomOffline').addEventListener('click', () => setMobileShelfTab('local'));
   byId('shelfBottomSettings').addEventListener('click', () => openSettings());
   byId('shelfMoreBtn').addEventListener('click', showMobileShelfMainMenu);
+  // Android 시스템 뒤로가기: 소설에서 앱을 종료하지 않고 서재로 돌아옵니다.
+  // 매번 책을 열 때 pushState로 독서 전용 이력을 한 단계 추가합니다.
   window.addEventListener('popstate', () => {
-    if (isMobileReaderDevice() && shouldShowMobileShelf() && !mobileShelfIsOpen) {
+    if (!isMobileReaderDevice() || !shouldShowMobileShelf()) return;
+    if (!mobileShelfIsOpen) {
       mobileShelfBackMarker = false;
-      showMobileBookshelf();
+      showMobileBookshelf({fromHistory: true});
     }
   });
   window.addEventListener('online', () => {
@@ -5723,14 +5728,33 @@ function hideMobileBookshelf() {
   mobileShelfRoot.classList.remove('is-visible');
 }
 
-function showMobileBookshelf() {
+function showMobileBookshelf({fromHistory = false} = {}) {
   if (!shouldShowMobileShelf()) return;
   createMobileBookshelf();
+
+  // 화면 이동 시 현재 책과 페이지 캐시는 보존합니다. 기기에 저장된 위치만
+  // 동기화 대상으로 정리하므로 Google Drive에 이전 위치를 덮어쓰지 않습니다.
+  if (!mobileShelfIsOpen && isMobileReaderDevice()) {
+    try { persistPendingReaderState(); }
+    catch (error) { console.warn('서재 이동 전 읽던 위치 보관 실패', error); }
+    cancelMobileTransientEffects();
+    setMobileReadingControlsVisible(false);
+  }
+
+  // 상단 '서재' 버튼으로 나올 때도 독서용 브라우저 이력을 제거합니다.
+  // 그렇지 않으면 다음 책을 연 뒤 뒤로가기를 누를 때 앱이 종료될 수 있습니다.
+  if (!fromHistory && isMobileReaderDevice() && mobileShelfBackMarker) {
+    mobileShelfBackMarker = false;
+    if (history.state?.novelReader === 'reading') {
+      history.back();
+    }
+  }
+
   mobileShelfIsOpen = true;
   mobileShelfRoot.classList.add('is-visible');
   closeMobileMenu();
   renderMobileBookshelf();
-  // No book parsing or remote requests just to display the home screen.
+  // 서재 복귀는 책을 다시 다운로드하거나 TXT를 재분석하지 않습니다.
 }
 
 function setMobileShelfTab(tab) {
@@ -5854,22 +5878,44 @@ function navigateShelfParent() {
   void navigateShelfTo(parent.length?parent[parent.length-1].id:libraryFolderId,parent);
 }
 
+// Android 물리 키보드의 Esc/브라우저 뒤로가기 키도 같은 동작을 사용합니다.
+document.addEventListener('keydown', event => {
+  if (!isMobileReaderDevice() || mobileShelfIsOpen || !selectedBook ||
+      event.altKey || event.ctrlKey || event.metaKey) return;
+  if (event.key === 'Escape' || event.key === 'BrowserBack') {
+    event.preventDefault();
+    showMobileBookshelf();
+  }
+}, true);
+
+function registerMobileReadingBackEntry() {
+  if (!isMobileReaderDevice() || mobileShelfBackMarker) return;
+  try {
+    // 책을 서재에서 열 때마다 새 이력을 만듭니다. 이전에 서재로 돌아온
+    // 기록이 남아 있다는 이유로 다음 책의 뒤로가기를 생략하지 않습니다.
+    history.pushState({novelReader:'reading', readerBackTarget:'bookshelf-v22'}, '', location.href);
+    mobileShelfBackMarker = true;
+  } catch (error) {
+    console.warn('Android 뒤로가기 이력 등록 실패', error);
+  }
+}
+
 async function openMobileShelfBook(book) {
   if (!hasOfflineBook(book.id) && (!navigator.onLine || !accessToken)) {
     alert('이 책은 기기에 저장되어 있지 않습니다. 인터넷 연결과 Google Drive 연결이 필요합니다.');
     return;
   }
+
+  // 책이 이미 메모리에 있더라도 서재에서 다시 들어갈 때 새 이력 생성.
+  registerMobileReadingBackEntry();
   if (selectedBook?.id===book.id &&
       (!txtReader.classList.contains('hidden') || !epubReader.classList.contains('hidden'))) {
     hideMobileBookshelf();
+    setMobileReadingControlsVisible(false);
     return;
   }
+
   hideMobileBookshelf();
-  // Keep Android back navigation inside the PWA.
-  if (isMobileReaderDevice() && !mobileShelfBackMarker) {
-    history.pushState({novelReader:'reading'}, '', location.href);
-    mobileShelfBackMarker=true;
-  }
   try { await openBook(book); }
   catch (error) {
     showMobileBookshelf();
