@@ -208,7 +208,7 @@ window.addEventListener("load", () => {
   void initializeOfflineReaderLibrary().then(async () => {
     const lastId = readerState.lastOpenedBookId;
     const local = readOfflineBookIndex().find(book => book.id === lastId);
-    if (local && !selectedBook) {
+    if (local && !selectedBook && !isMobileReaderDevice()) {
       try { await openBook(local); }
       catch (error) { console.warn('저장된 책 빠른 복원 실패', error); }
     }
@@ -413,7 +413,7 @@ async function connectGoogleDrive() {
 
 
     if (
-      !selectedBook && readerState.lastOpenedBookId
+      !isMobileReaderDevice() && !selectedBook && readerState.lastOpenedBookId
     ) {
 
       const book =
@@ -492,7 +492,7 @@ async function autoReconnectGoogleDrive() {
 
 
     if (
-      !selectedBook && readerState.lastOpenedBookId
+      !isMobileReaderDevice() && !selectedBook && readerState.lastOpenedBookId
     ) {
 
       const book =
@@ -883,9 +883,13 @@ async function driveListChildren(folderId) {
 async function loadBooks() {
   if (!libraryFolderId) return;
   if (!currentFolderId) currentFolderId = libraryFolderId;
-  const items = await driveListChildren(currentFolderId);
+  const requestedFolderId = currentFolderId;
+  const items = await driveListChildren(requestedFolderId);
+  // Ignore stale responses when a user rapidly opens another folder.
+  if (requestedFolderId !== currentFolderId) return;
   folders = items.filter(item => item.mimeType === "application/vnd.google-apps.folder");
   books = items.filter(item => item.mimeType !== "application/vnd.google-apps.folder" && /\.(txt|epub)$/i.test(item.name));
+  rememberMobileShelfFolder(requestedFolderId, folders, books);
   renderBooks();
 }
 
@@ -931,6 +935,7 @@ function renderBooks() {
     menu.setAttribute("aria-label", book.name + " 관리");
     row.append(open, menu); bookList.append(row);
   });
+  renderMobileBookshelf();
 }
 
 async function runLibraryAction(action) {
@@ -1221,6 +1226,8 @@ async function multipartUpload(
 ========================================================= */
 
 async function openBook(book) {
+
+  if (isMobileReaderDevice()) hideMobileBookshelf();
 
   selectedBook =
     book;
@@ -3245,8 +3252,11 @@ function initializeMobilePagedReading() {
 
   ui.querySelector('#mReaderLibraryBtn').addEventListener('click', () => {
     setMobileReadingControlsVisible(false);
-    sidebar.classList.add('open');
-    overlay.classList.remove('hidden');
+    if (isMobileReaderDevice()) showMobileBookshelf();
+    else {
+      sidebar.classList.add('open');
+      overlay.classList.remove('hidden');
+    }
   });
   ui.querySelector('#mReaderCloseBtn').addEventListener('click', () =>
     setMobileReadingControlsVisible(false));
@@ -4952,6 +4962,7 @@ function renderOfflineOnlyBookList() {
   });
   if (loginStatus && !navigator.onLine) loginStatus.textContent =
     '오프라인 독서 · 읽던 위치는 이 기기에 저장됩니다';
+  renderMobileBookshelf();
 }
 async function initializeOfflineReaderLibrary() {
   initializeOfflineDownloadButtons();
@@ -5368,3 +5379,458 @@ function initializeManualReaderSyncButton() {
 }
 window.addEventListener('load', () => initializeManualReaderSyncButton());
 window.addEventListener('load', () => initializeReaderBrightness());
+
+
+/* =========================================================
+   v18 · Android PWA 서재 홈
+   - Drive 폴더 먼저 표시, 책은 아래 표시
+   - 책을 눌러야 렌더링하므로 앱 첫 화면이 가벼움
+   - 모바일에서만 사용하며 PC 독서 방식은 기존대로 유지
+   - 책 원본은 기존 IndexedDB 오프라인 캐시 재사용
+========================================================= */
+
+const MOBILE_SHELF_VERSION = 'v18-drive-bookshelf-20261023';
+const MOBILE_SHELF_CACHE_PREFIX = 'driveReaderShelfFolder-v18-';
+let mobileShelfRoot = null;
+let mobileShelfIsOpen = false;
+let mobileShelfTab = 'all';
+let mobileShelfSearchOpen = false;
+let mobileShelfSearchText = '';
+let mobileShelfLoading = false;
+let mobileShelfDialog = null;
+let mobileShelfBackMarker = false;
+
+function shouldShowMobileShelf() {
+  return isMobileReaderDevice() && window.matchMedia('(max-width:800px)').matches;
+}
+
+function mobileShelfCacheKey(folderId) {
+  return MOBILE_SHELF_CACHE_PREFIX +
+    ((folderId && folderId === libraryFolderId) || !folderId ? 'root' : folderId);
+}
+
+function rememberMobileShelfFolder(folderId, childFolders, childBooks) {
+  try {
+    const snapshot = {
+      at: Date.now(),
+      folders: childFolders.slice(0, 1000).map(f => ({
+        id:f.id, name:f.name, mimeType:f.mimeType, parents:f.parents || [folderId]
+      })),
+      books:childBooks.slice(0, 2000).map(b => ({
+        id:b.id, name:b.name, mimeType:b.mimeType, parents:b.parents || [folderId]
+      }))
+    };
+    localStorage.setItem(mobileShelfCacheKey(folderId), JSON.stringify(snapshot));
+  } catch (error) {
+    console.warn('서재 목록 캐시 저장 실패', error);
+  }
+}
+
+function readMobileShelfFolderCache(folderId) {
+  try {
+    return JSON.parse(localStorage.getItem(mobileShelfCacheKey(folderId)) || 'null');
+  } catch { return null; }
+}
+
+function mobileShelfVisibleItems() {
+  const cached = readMobileShelfFolderCache(currentFolderId);
+  let visibleFolders = [];
+  let visibleBooks = [];
+  const currentlyConnected = !!libraryFolderId &&
+    currentFolderId === (currentFolderId || libraryFolderId) && navigator.onLine;
+
+  if (currentlyConnected && Array.isArray(folders) && Array.isArray(books) &&
+      mobileShelfTab === 'all') {
+    visibleFolders = [...folders];
+    visibleBooks = [...books];
+  } else if (cached) {
+    visibleFolders = [...(cached.folders || [])];
+    visibleBooks = [...(cached.books || [])];
+  }
+
+  // Previous reader versions only tracked locally saved books in the offline
+  // index. Make those visible at the root even if a folder snapshot is absent.
+  if (!cached && (!libraryFolderId || !navigator.onLine)) {
+    visibleBooks = readOfflineBookIndex().map(book => ({
+      id: book.id, name: book.name, mimeType: book.mimeType
+    }));
+  }
+
+  if (mobileShelfTab === 'local' || !navigator.onLine) {
+    const offlineIds = new Set(readOfflineBookIndex().map(b => b.id));
+    visibleBooks = visibleBooks.filter(book => offlineIds.has(book.id));
+  }
+  const needle = mobileShelfSearchText.trim().toLocaleLowerCase();
+  if (needle) {
+    visibleFolders = visibleFolders.filter(f => f.name.toLocaleLowerCase().includes(needle));
+    visibleBooks = visibleBooks.filter(b => b.name.toLocaleLowerCase().includes(needle));
+  }
+  const byName = (a, b) => a.name.localeCompare(b.name, undefined, {numeric:true});
+  visibleFolders.sort(byName);
+  visibleBooks.sort(byName);
+  return {visibleFolders, visibleBooks};
+}
+
+function createMobileBookshelf() {
+  if (mobileShelfRoot || !shouldShowMobileShelf()) return;
+  const style = document.createElement('style');
+  style.id = 'mobileShelfStyle';
+  style.textContent = `
+  #mobileBookshelf {display:none}
+  @media(max-width:800px) {
+    #mobileBookshelf {
+      position:fixed; inset:0; z-index:90; display:none; overflow:hidden;
+      background:#faf9f7; color:#302a25; font-family:system-ui,-apple-system,'Noto Sans SC',sans-serif;
+      --shelf-accent:#bb4a41; --shelf-header:#795548;
+    }
+    #mobileBookshelf.is-visible {display:flex;flex-direction:column}
+    #mobileBookshelf button, #mobileBookshelf input {font:inherit}
+    #mobileBookshelf .shelf-top {background:var(--shelf-header); color:#fff; flex-shrink:0; padding-top:env(safe-area-inset-top,0px)}
+    #mobileBookshelf .shelf-navigation {height:64px;display:flex;align-items:center;padding:0 15px;gap:10px}
+    #mobileBookshelf .shelf-page-title {font-size:21px;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    #mobileBookshelf .shelf-icon {border:0;color:inherit;background:transparent;min-width:42px;min-height:44px;border-radius:10px;font-size:24px;cursor:pointer}
+    #mobileBookshelf .shelf-icon:active {background:#ffffff25}
+    #mobileBookshelf .shelf-tabs {display:flex;gap:32px;padding:0 24px;height:54px;align-items:stretch}
+    #mobileBookshelf .shelf-tab {background:none;color:#fff9;border:0;border-bottom:3px solid transparent;padding:0 2px;font-size:16px}
+    #mobileBookshelf .shelf-tab.active {color:#fff;border-color:#f46d64}
+    #mobileBookshelf .shelf-search {margin:0 16px 12px;width:calc(100% - 32px);border-radius:9px;padding:11px 12px;border:0;outline:none;display:none;background:#fff;color:#333}
+    #mobileBookshelf .shelf-search.active {display:block}
+    #mobileBookshelf .shelf-list {flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;background:#faf9f7;padding-bottom:24px}
+    #mobileBookshelf .shelf-breadcrumb {display:flex;gap:5px;align-items:center;padding:14px 14px 8px;color:#88786d;flex-wrap:wrap;font-size:13px}
+    #mobileBookshelf .shelf-breadcrumb button {background:none;border:0;color:inherit;padding:4px 5px}
+    #mobileBookshelf .shelf-section-label {padding:14px 20px 8px;font-size:12px;color:#8a847e;font-weight:700;letter-spacing:.03em}
+    #mobileBookshelf .shelf-folder-row {display:flex;align-items:center;gap:12px;padding:12px 16px;min-height:68px;background:white;border-bottom:1px solid #eceae7}
+    #mobileBookshelf .shelf-folder-open {border:0;display:flex;flex:1;align-items:center;text-align:left;gap:15px;background:none;min-width:0;color:#282828}
+    #mobileBookshelf .shelf-folder-open .folder-symbol {display:grid;place-items:center;width:49px;height:45px;color:#b28a4c;background:#f8edd8;border-radius:12px;font-size:26px}
+    #mobileBookshelf .shelf-folder-open .folder-name {min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:17px;font-weight:600}
+    #mobileBookshelf .shelf-item-menu {background:none;border:0;min-width:35px;height:44px;color:#8c8885;font-size:23px}
+    #mobileBookshelf .shelf-book-row {display:flex;align-items:center;gap:12px;padding:14px 16px;background:#faf9f7;border-bottom:1px solid #eeeae7;min-height:146px}
+    #mobileBookshelf .shelf-cover {width:90px;height:121px;flex-shrink:0;border:1px solid #bdb8af;border-radius:3px;box-shadow:2px 2px 5px #0002,inset 3px 0 0 #8a786553;background:linear-gradient(135deg,#fffdf9,#eee9de);position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden}
+    #mobileBookshelf .shelf-cover::after {content:' ';position:absolute;inset:6px;border:1px solid #bdaaa157;pointer-events:none}
+    #mobileBookshelf .shelf-cover-title {writing-mode:vertical-rl;max-height:102px;max-width:72px;overflow:hidden;word-break:break-all;font-size:13px;color:#9d453b;font-weight:750;line-height:1.5}
+    #mobileBookshelf .shelf-book-open {border:0;background:none;color:inherit;text-align:left;flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;gap:9px;min-height:118px}
+    #mobileBookshelf .shelf-book-title {font-size:18px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-all;color:#252525}
+    #mobileBookshelf .shelf-book-meta {font-size:13px;color:#8c8985;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    #mobileBookshelf .shelf-offline-tag {font-size:12px;color:#568b64;background:#e4f3e7;border-radius:99px;padding:3px 7px;align-self:flex-start}
+    #mobileBookshelf .shelf-bottom {padding-bottom:env(safe-area-inset-bottom,0px);height:66px;box-sizing:content-box;flex-shrink:0;background:#f3f2f0;border-top:1px solid #ddd8d3;display:flex;align-items:center;justify-content:space-around}
+    #mobileBookshelf .shelf-bottom button {border:0;background:none;color:#706b67;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:3px;font-size:11px;min-width:80px}
+    #mobileBookshelf .shelf-bottom button span {font-size:22px;line-height:1.1}
+    #mobileBookshelf .shelf-bottom button.active {color:#c1483e;font-weight:700}
+    #mobileBookshelf .shelf-empty {padding:42px 25px;text-align:center;line-height:1.7;color:#777}
+    #mobileShelfDialog {position:fixed;inset:0;z-index:501;background:#0006;display:flex;align-items:flex-end}
+    #mobileShelfDialog .shelf-dialog-sheet {background:#fff;color:#302a25;width:100%;max-height:77dvh;overflow-y:auto;border-radius:18px 18px 0 0;padding:20px 17px calc(24px + env(safe-area-inset-bottom,0px));box-shadow:0 -6px 22px #0002}
+    #mobileShelfDialog .shelf-dialog-title {font-weight:750;font-size:17px;margin-bottom:15px;word-break:break-all}
+    #mobileShelfDialog .shelf-dialog-option {width:100%;border:0;background:#fff;padding:15px 8px;text-align:left;border-bottom:1px solid #eee;color:#333}
+    #mobileShelfDialog .shelf-dialog-close {margin-top:12px;border:0;background:#eee;border-radius:10px;padding:13px;width:100%;color:#333}
+  }
+  `;
+  document.head.appendChild(style);
+
+  mobileShelfRoot = document.createElement('section');
+  mobileShelfRoot.id = 'mobileBookshelf';
+  mobileShelfRoot.setAttribute('aria-label','내 서재');
+  mobileShelfRoot.innerHTML = `
+    <header class="shelf-top">
+      <div class="shelf-navigation">
+        <button class="shelf-icon" id="shelfBack" title="상위 폴더">‹</button>
+        <div class="shelf-page-title" id="shelfTitle">내 서재</div>
+        <button class="shelf-icon" id="shelfSearchBtn" aria-label="검색">⌕</button>
+        <button class="shelf-icon" id="shelfMoreBtn" aria-label="더보기">⋮</button>
+      </div>
+      <nav class="shelf-tabs">
+        <button class="shelf-tab active" id="shelfAllTab">전체</button>
+        <button class="shelf-tab" id="shelfOfflineTab">오프라인</button>
+      </nav>
+      <input class="shelf-search" id="shelfSearchInput" placeholder="현재 폴더에서 책이나 폴더 검색" type="search" />
+    </header>
+    <div class="shelf-list" id="shelfListing"></div>
+    <nav class="shelf-bottom">
+      <button id="shelfBottomBooks" class="active"><span>▤</span>서재</button>
+      <button id="shelfBottomOffline"><span>↓</span>오프라인</button>
+      <button id="shelfBottomSettings"><span>⚙</span>설정</button>
+    </nav>
+  `;
+  document.body.appendChild(mobileShelfRoot);
+  const byId = id => mobileShelfRoot.querySelector('#' + id);
+  byId('shelfBack').addEventListener('click', () => navigateShelfParent());
+  byId('shelfSearchBtn').addEventListener('click', () => {
+    mobileShelfSearchOpen = !mobileShelfSearchOpen;
+    byId('shelfSearchInput').classList.toggle('active', mobileShelfSearchOpen);
+    if (mobileShelfSearchOpen) byId('shelfSearchInput').focus();
+    else { mobileShelfSearchText=''; byId('shelfSearchInput').value=''; renderMobileBookshelf(); }
+  });
+  byId('shelfSearchInput').addEventListener('input', e => {
+    mobileShelfSearchText = e.target.value || '';
+    renderMobileBookshelf();
+  });
+  byId('shelfAllTab').addEventListener('click', () => setMobileShelfTab('all'));
+  byId('shelfOfflineTab').addEventListener('click', () => setMobileShelfTab('local'));
+  byId('shelfBottomBooks').addEventListener('click', () => {
+    setMobileShelfTab('all');
+    void navigateShelfTo(libraryFolderId || currentFolderId || '', []);
+  });
+  byId('shelfBottomOffline').addEventListener('click', () => setMobileShelfTab('local'));
+  byId('shelfBottomSettings').addEventListener('click', () => openSettings());
+  byId('shelfMoreBtn').addEventListener('click', showMobileShelfMainMenu);
+  window.addEventListener('popstate', () => {
+    if (shouldShowMobileShelf() && !mobileShelfIsOpen) {
+      mobileShelfBackMarker = false;
+      showMobileBookshelf();
+    }
+  });
+  window.addEventListener('online', () => {
+    if (mobileShelfIsOpen && libraryFolderId) {
+      void loadBooks().catch(error => console.warn('서재 온라인 갱신 실패', error));
+    }
+  });
+  mobileShelfIsOpen = true;
+  mobileShelfRoot.classList.add('is-visible');
+  renderMobileBookshelf();
+}
+
+function hideMobileBookshelf() {
+  if (!mobileShelfRoot) return;
+  mobileShelfIsOpen = false;
+  mobileShelfRoot.classList.remove('is-visible');
+}
+
+function showMobileBookshelf() {
+  if (!shouldShowMobileShelf()) return;
+  createMobileBookshelf();
+  mobileShelfIsOpen = true;
+  mobileShelfRoot.classList.add('is-visible');
+  closeMobileMenu();
+  renderMobileBookshelf();
+  // No book parsing or remote requests just to display the home screen.
+}
+
+function setMobileShelfTab(tab) {
+  mobileShelfTab = tab;
+  renderMobileBookshelf();
+}
+
+function mobileShelfProgress(book) {
+  const txt = readerState.txtProgress?.[book.id];
+  if (txt && Number.isFinite(Number(txt.chapterIndex))) {
+    return `이어 읽기 · ${Number(txt.chapterIndex) + 1}장`;
+  }
+  if (readerState.epubProgress?.[book.id]?.cfi) return '이어 읽기 · 마지막 위치';
+  return '아직 읽지 않음';
+}
+
+function shelfMakeNode(tag, className, text) {
+  const el = document.createElement(tag);
+  if (className) el.className=className;
+  if (text != null) el.textContent=String(text);
+  return el;
+}
+
+function renderMobileBookshelf() {
+  if (!mobileShelfRoot || !shouldShowMobileShelf()) return;
+  const byId = id => mobileShelfRoot.querySelector('#' + id);
+  const activeName = folderPath.length ? folderPath[folderPath.length-1].name : '내 서재';
+  byId('shelfTitle').textContent=activeName;
+  byId('shelfBack').style.visibility=folderPath.length ? 'visible' : 'hidden';
+  byId('shelfAllTab').classList.toggle('active', mobileShelfTab==='all');
+  byId('shelfOfflineTab').classList.toggle('active', mobileShelfTab==='local');
+  byId('shelfBottomBooks').classList.toggle('active', mobileShelfTab==='all');
+  byId('shelfBottomOffline').classList.toggle('active', mobileShelfTab==='local');
+  const list = byId('shelfListing');
+  list.replaceChildren();
+
+  const crumbs = shelfMakeNode('div','shelf-breadcrumb');
+  const home = shelfMakeNode('button','', '내 서재');
+  home.onclick=() => void navigateShelfTo(libraryFolderId || '', []);
+  crumbs.appendChild(home);
+  folderPath.forEach((part,i) => {
+    const crumb=shelfMakeNode('button','', '› '+part.name);
+    crumb.onclick=() => void navigateShelfTo(part.id,folderPath.slice(0,i+1));
+    crumbs.appendChild(crumb);
+  });
+  list.appendChild(crumbs);
+
+  if (mobileShelfLoading) {
+    list.appendChild(shelfMakeNode('div','shelf-empty','폴더를 불러오는 중...'));
+    return;
+  }
+  const {visibleFolders,visibleBooks} = mobileShelfVisibleItems();
+  const offlineIds = new Set(readOfflineBookIndex().map(b => b.id));
+  if (!visibleFolders.length && !visibleBooks.length) {
+    const message = !navigator.onLine
+      ? '현재 폴더에서 오프라인 저장한 책을 찾지 못했습니다.\n인터넷 연결 상태에서 책을 저장하면 여기서 읽을 수 있어요.'
+      : !accessToken && !readMobileShelfFolderCache(currentFolderId)
+        ? 'Google Drive를 연결하면 폴더와 책 목록이 나타납니다.\n오른쪽 위 ⋮ 메뉴에서 연결해 주세요.'
+        : '이 폴더에는 표시할 책이 없습니다.';
+    const blank=shelfMakeNode('div','shelf-empty',message);
+    blank.style.whiteSpace='pre-line';list.appendChild(blank);
+  }
+  if (visibleFolders.length) {
+    list.appendChild(shelfMakeNode('div','shelf-section-label',`폴더 · ${visibleFolders.length}`));
+    visibleFolders.forEach(folder => {
+      const row=shelfMakeNode('div','shelf-folder-row');
+      const open=shelfMakeNode('button','shelf-folder-open');
+      open.type='button';
+      open.append(shelfMakeNode('span','folder-symbol','📁'), shelfMakeNode('span','folder-name',folder.name));
+      open.addEventListener('click',() => void navigateShelfTo(folder.id,[...folderPath,{id:folder.id,name:folder.name}]));
+      const menu=shelfMakeNode('button','shelf-item-menu','⋮');
+      menu.type='button';menu.setAttribute('aria-label',folder.name+' 관리');
+      menu.onclick=() => showMobileShelfFileMenu(folder,true);
+      row.append(open,menu);list.appendChild(row);
+    });
+  }
+  if (visibleBooks.length) {
+    list.appendChild(shelfMakeNode('div','shelf-section-label',`소설 · ${visibleBooks.length}`));
+    visibleBooks.forEach(book => {
+      const row=shelfMakeNode('div','shelf-book-row');
+      const cover=shelfMakeNode('div','shelf-cover');
+      const rawTitle=book.name.replace(/\.(txt|epub)$/i,'');
+      cover.appendChild(shelfMakeNode('span','shelf-cover-title',rawTitle));
+      const open=shelfMakeNode('button','shelf-book-open');open.type='button';
+      open.appendChild(shelfMakeNode('span','shelf-book-title',rawTitle));
+      open.appendChild(shelfMakeNode('span','shelf-book-meta',mobileShelfProgress(book)));
+      if(offlineIds.has(book.id)) open.appendChild(shelfMakeNode('span','shelf-offline-tag','✓ 오프라인 저장됨'));
+      open.onclick=() => void openMobileShelfBook(book);
+      const menu=shelfMakeNode('button','shelf-item-menu','⋮');
+      menu.type='button';menu.setAttribute('aria-label',book.name+' 관리');
+      menu.onclick=()=>showMobileShelfFileMenu(book,false);
+      row.append(cover,open,menu);list.appendChild(row);
+    });
+  }
+}
+
+async function navigateShelfTo(folderId,path) {
+  if (!shouldShowMobileShelf()) return;
+  const dest=folderId || libraryFolderId || '';
+  const goingToExisting = currentFolderId===dest && JSON.stringify(folderPath)===JSON.stringify(path);
+  folderPath=path;
+  currentFolderId=dest;
+  mobileShelfSearchText='';
+  const search=mobileShelfRoot?.querySelector('#shelfSearchInput');
+  if(search) search.value='';
+  if (!navigator.onLine || !accessToken || !libraryFolderId) {
+    mobileShelfLoading=false;
+    renderMobileBookshelf();
+    return;
+  }
+  if (goingToExisting && readMobileShelfFolderCache(dest)) {
+    renderMobileBookshelf();
+    return;
+  }
+  mobileShelfLoading=true;renderMobileBookshelf();
+  try { await loadBooks(); }
+  catch (error) { console.error('폴더 열기 실패',error); alert('폴더를 열 수 없습니다: '+error.message); }
+  finally { mobileShelfLoading=false;renderMobileBookshelf(); }
+}
+
+function navigateShelfParent() {
+  const parent=folderPath.slice(0,-1);
+  void navigateShelfTo(parent.length?parent[parent.length-1].id:libraryFolderId,parent);
+}
+
+async function openMobileShelfBook(book) {
+  if (!hasOfflineBook(book.id) && (!navigator.onLine || !accessToken)) {
+    alert('이 책은 기기에 저장되어 있지 않습니다. 인터넷 연결과 Google Drive 연결이 필요합니다.');
+    return;
+  }
+  if (selectedBook?.id===book.id &&
+      (!txtReader.classList.contains('hidden') || !epubReader.classList.contains('hidden'))) {
+    hideMobileBookshelf();
+    return;
+  }
+  hideMobileBookshelf();
+  // Keep Android back navigation inside the PWA.
+  if (!mobileShelfBackMarker) {
+    history.pushState({novelReader:'reading'}, '', location.href);
+    mobileShelfBackMarker=true;
+  }
+  try { await openBook(book); }
+  catch (error) {
+    showMobileBookshelf();
+    console.error('소설 열기 실패',error);
+    alert('소설을 열 수 없습니다: '+error.message);
+  }
+}
+
+function closeMobileShelfDialog() {
+  if (mobileShelfDialog) mobileShelfDialog.remove();
+  mobileShelfDialog=null;
+}
+
+function openMobileShelfDialog(title,options) {
+  closeMobileShelfDialog();
+  const backdrop=shelfMakeNode('div','');backdrop.id='mobileShelfDialog';
+  const sheet=shelfMakeNode('div','shelf-dialog-sheet');
+  sheet.appendChild(shelfMakeNode('div','shelf-dialog-title',title));
+  options.forEach(option => {
+    const btn=shelfMakeNode('button','shelf-dialog-option',option.label);
+    btn.type='button';btn.addEventListener('click',()=>{
+      closeMobileShelfDialog();
+      void Promise.resolve().then(option.action).catch(err=>{
+        console.error(err);alert('작업 실패: '+err.message);
+      });
+    });
+    sheet.appendChild(btn);
+  });
+  const close=shelfMakeNode('button','shelf-dialog-close','취소');
+  close.onclick=closeMobileShelfDialog;
+  sheet.appendChild(close);
+  backdrop.appendChild(sheet);
+  backdrop.addEventListener('click',e=>{if(e.target===backdrop)closeMobileShelfDialog();});
+  document.body.appendChild(backdrop);
+  mobileShelfDialog=backdrop;
+}
+
+function showMobileShelfFileMenu(item,isFolder) {
+  openMobileShelfDialog(item.name,[
+    ...(!isFolder?[{label:'📖 이어서 읽기',action:()=>openMobileShelfBook(item)}]:[]),
+    {label:'✎ 이름 변경',action:()=>driveRename(item)},
+    {label:'📂 다른 폴더로 이동',action:()=>showMobileShelfMoveTargets(item,isFolder)}
+  ]);
+}
+
+async function showMobileShelfMoveTargets(item,isFolder) {
+  if (!navigator.onLine || !accessToken) {
+    alert('파일 이동은 Google Drive 연결이 필요합니다.');return;
+  }
+  // Explicit move action only: scanning nested destinations at app startup
+  // would slow the reader down.
+  const destinations=[{id:libraryFolderId,name:'내 서재 (최상위)',depth:0},
+    ...await listAllFolders(libraryFolderId)];
+  const prohibited=new Set([item.id]);
+  if (isFolder) (await listAllFolders(item.id)).forEach(f=>prohibited.add(f.id));
+  openMobileShelfDialog('이동할 폴더를 선택하세요',destinations
+    .filter(d=>!prohibited.has(d.id))
+    .map(dest=>({
+      label:'　'.repeat(Math.min(8,dest.depth))+'📁 '+dest.name,
+      action: async()=>{
+        const parentId=(item.parents || [currentFolderId])[0];
+        if(dest.id===parentId)return;
+        const p=new URLSearchParams({addParents:dest.id,fields:'id,name,parents'});
+        if(parentId)p.set('removeParents',parentId);
+        await apiFetch('https://www.googleapis.com/drive/v3/files/'+encodeURIComponent(item.id)+'?'+p,{method:'PATCH'});
+        await loadBooks();
+        alert('선택한 폴더로 이동했습니다.');
+      }
+    })));
+}
+
+function showMobileShelfMainMenu() {
+  openMobileShelfDialog('내 서재 관리',[
+    {label:'📁 현재 위치에 새 폴더 만들기',action:()=>createLibraryFolder()},
+    {label:'↑ 현재 위치에 TXT/EPUB 업로드',action:()=>fileInput.click()},
+    {label:'⟳ 이 폴더 새로고침',action:async()=>{
+      if(!accessToken){alert('Google Drive를 연결해 주세요.');return;}
+      await loadBooks();
+    }},
+    {label:'☁ Google Drive 연결',action:()=>connectGoogleDrive()},
+    {label:'⚙ 읽기 설정',action:()=>openSettings()}
+  ]);
+}
+
+// Create the shelf immediately, rather than waiting for OAuth or downloading
+// an entire TXT novel. Mobile starts at the library, desktop stays unchanged.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded',createMobileBookshelf,{once:true});
+} else {
+  createMobileBookshelf();
+}
