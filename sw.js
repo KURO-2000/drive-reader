@@ -1,5 +1,5 @@
 /* v10: PWA 앱 화면과 EPUB 엔진을 오프라인에서 실행하도록 보관합니다. */
-const CACHE_NAME = 'drive-novel-reader-v17-trusted-progress-20261019';
+const CACHE_NAME = 'drive-novel-reader-v18-bookshelf-20261023';
 const EPUB_RUNTIME_URL = 'https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js';
 const APP_SHELL = [
   './', './index.html', './style.css', './app.js',
