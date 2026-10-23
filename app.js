@@ -3092,7 +3092,7 @@ window.addEventListener(
    - PC는 기존 세로 스크롤 방식 유지
    - 좌우 탭/스와이프: 페이지 이동
    - 가운데 터치: 읽기 메뉴 표시/숨김
-   - 진행바: 책 전체 위치 이동
+   - 진행바: 현재 장의 위치 이동
    - 하단 이전 장 / 다음 장: 페이지가 아닌 장 이동
 ========================================================= */
 
@@ -3294,7 +3294,7 @@ function initializeMobilePagedReading() {
 
   const ui = document.createElement('div');
   ui.id = 'mobileReaderUi';
-  ui.dataset.readerVersion = 'v14.1-mobile-ui-only';
+  ui.dataset.readerVersion = 'v23-chapter-pages';
   ui.setAttribute('aria-label', '휴대폰 독서 메뉴');
   ui.innerHTML = `
     <div class="mobile-reader-top">
@@ -3305,7 +3305,7 @@ function initializeMobilePagedReading() {
     <div class="mobile-reader-bottom">
       <div class="mobile-reader-progress-text" id="mReaderProgressText">위치 불러오는 중...</div>
       <div class="mobile-reader-progress-row">
-        <input id="mReaderProgressSlider" type="range" min="0" max="1000" step="1" value="0" aria-label="책 전체 읽기 위치 이동" />
+        <input id="mReaderProgressSlider" type="range" min="0" max="1000" step="1" value="0" aria-label="현재 장 안에서 읽기 위치 이동" />
         <span id="mReaderPercent">0%</span>
       </div>
       <div class="mobile-reader-chapter-row">
@@ -3476,58 +3476,61 @@ function buildMobileTxtLengthIndex() {
   mobilePageState.totalChars = Math.max(1, total);
 }
 
-function getMobileBookPercent() {
+/*
+ * v23: 진행바와 표시 백분율은 책 전체가 아닌 현재 장 기준.
+ * TXT에서는 기존 페이지 경계/본문 글자 위치만 참조하므로 추가 페이지 계산이 없습니다.
+ * Drive에는 기존 chapterIndex + charOffset 기록을 그대로 사용합니다.
+ */
+function getMobileChapterPercent() {
   if (isMobileTxtBook()) {
     if (isVirtualMobileTxt()) {
-      const chapterStart = mobilePageState.chapterPrefix[currentTxtChapter] || 0;
+      const chapterLength = Math.max(1,
+        txtChapters[currentTxtChapter]?.content?.length || 1);
       const offset = virtualTxtCurrentOffset();
-      return Math.max(0, Math.min(1,
-        (chapterStart + offset) / mobilePageState.totalChars));
+      return Math.min(1, Math.max(0, offset / chapterLength));
     }
-    const start = mobilePageState.chapterPrefix[currentTxtChapter] || 0;
-    const len = Math.max(1, txtChapters[currentTxtChapter]?.content?.length || 1);
-    const r = mobilePageState.txtPages <= 1 ? 0 :
-      mobilePageState.txtPageIndex / (mobilePageState.txtPages - 1);
-    return Math.min(1, (start + r * len) / mobilePageState.totalChars);
+    return mobilePageState.txtPages <= 1 ? 0 :
+      Math.max(0, Math.min(1,
+        mobilePageState.txtPageIndex / (mobilePageState.txtPages - 1)));
   }
-  const loc = mobilePageState.epubLocation;
-  const cfi = loc?.start?.cfi;
-  if (mobilePageState.epubLocationsReady && cfi) {
-    const p = mobilePageState.epubLocationBook?.locations?.percentageFromCfi(cfi);
-    if (Number.isFinite(p)) return Math.min(1, Math.max(0, p));
-  }
-  const spineLen = epubBook?.spine?.length || epubBook?.spine?.items?.length || 1;
-  const spineIndex = loc?.start?.index || 0;
-  const local = loc?.start?.displayed;
-  const localP = local?.total ? (Math.max(0, local.page - 1) / local.total) : 0;
-  return Math.max(0, Math.min(1, (spineIndex + localP) / spineLen));
+  // epub.js의 displayed.page/total 값은 현재 EPUB spine(장) 내의 값입니다.
+  const displayed = mobilePageState.epubLocation?.start?.displayed;
+  if (!displayed || !(displayed.total > 1)) return 0;
+  return Math.max(0, Math.min(1,
+    (displayed.page - 1) / (displayed.total - 1)));
 }
 
 function updateMobileProgressDisplay() {
   if (!isMobilePagedReading() || !mobilePageState.controls) return;
-  const percent = getMobileBookPercent();
+  const chapterPercent = getMobileChapterPercent();
   if (!mobilePageState.sliderDragging) {
-    mobilePageState.slider.value = String(Math.round(percent * 1000));
+    mobilePageState.slider.value = String(Math.round(chapterPercent * 1000));
   }
-  mobilePageState.subtitle.textContent = `${Math.round(percent * 100)}%`;
-  mobilePageState.controls.querySelector('#mReaderTitle').textContent = selectedBook?.name || '';
+  mobilePageState.subtitle.textContent =
+    `${Math.round(chapterPercent * 100)}%`;
+  mobilePageState.controls.querySelector('#mReaderTitle').textContent =
+    selectedBook?.name || '';
   let label;
   if (isMobileTxtBook()) {
     if (isVirtualMobileTxt()) {
       const layout = virtualTxtActive;
       const pages = layout?.complete
-        ? String(layout.boundaries.length - 1)
+        ? String(Math.max(1, layout.boundaries.length - 1))
         : `약 ${virtualTxtApproximatePageCount(layout)}`;
       label = `${currentTxtChapter + 1}/${txtChapters.length}장 · ` +
-        `${mobilePageState.txtPageIndex + 1}/${pages}페이지 · 전체 ${Math.round(percent*100)}%`;
+        `${mobilePageState.txtPageIndex + 1}/${pages}페이지 · ` +
+        `현재 장 ${Math.round(chapterPercent * 100)}%`;
     } else {
       label = `${currentTxtChapter + 1}/${txtChapters.length}장 · ` +
-        `${mobilePageState.txtPageIndex + 1}/${mobilePageState.txtPages}페이지 · 전체 ${Math.round(percent*100)}%`;
+        `${mobilePageState.txtPageIndex + 1}/${mobilePageState.txtPages}페이지 · ` +
+        `현재 장 ${Math.round(chapterPercent * 100)}%`;
     }
   } else {
     const loc = mobilePageState.epubLocation?.start?.displayed;
-    const pageText = loc?.total ? `${loc.page}/${loc.total}페이지` : '페이지 확인 중';
-    label = `${pageText} · 전체 ${Math.round(percent * 100)}%`;
+    const pageText = loc?.total
+      ? `${loc.page}/${loc.total}페이지`
+      : '페이지 확인 중';
+    label = `${pageText} · 현재 장 ${Math.round(chapterPercent * 100)}%`;
   }
   mobilePageState.progressLabel.textContent = label;
   const prev = mobilePageState.controls.querySelector('#mReaderPrevChapter');
@@ -3883,40 +3886,72 @@ async function moveMobileChapter(direction) {
   }
 }
 
+/* EPUB 책 전체 CFI 목록 중 현재 장(spine section)에 속한 위치만 추립니다.
+ * 계산된 값은 책/장별로 재사용합니다. 위치 계산은 슬라이더 조작 시에만 시작합니다.
+ */
+let mobileEpubChapterCfiCache = {book:null, sections:new Map()};
+
+function mobileEpubChapterCfis() {
+  if (!epubBook?.spine || !mobilePageState.epubLocation?.start?.cfi)
+    return [];
+  const section = epubBook.spine.get(mobilePageState.epubLocation.start.cfi);
+  if (!section || !Number.isInteger(section.index)) return [];
+
+  if (mobileEpubChapterCfiCache.book !== epubBook) {
+    mobileEpubChapterCfiCache = {book:epubBook, sections:new Map()};
+  }
+  if (mobileEpubChapterCfiCache.sections.has(section.index)) {
+    return mobileEpubChapterCfiCache.sections.get(section.index);
+  }
+
+  const all = epubBook.locations?._locations || epubBook.locations?.locations;
+  if (!Array.isArray(all)) return [];
+  const inSection = [];
+  for (const item of all) {
+    const cfi = typeof item === 'string' ? item : item?.cfi;
+    if (!cfi) continue;
+    try {
+      if (epubBook.spine.get(cfi)?.index === section.index) inSection.push(cfi);
+    } catch (_) { /* EPUB 내부 링크 등 위치 추적이 불가능한 구간 제외 */ }
+  }
+  mobileEpubChapterCfiCache.sections.set(section.index, inSection);
+  return inSection;
+}
+
 async function seekMobileBookProgress(p) {
   if (!isMobilePagedReading()) return;
-  const target = Math.max(0, Math.min(0.999999, p));
+  const target = Math.max(0, Math.min(1, p));
   if (isMobileTxtBook()) {
-    const chars = target * mobilePageState.totalChars;
-    let low = 0;
-    let high = txtChapters.length - 1;
-    while (low < high) {
-      const mid = (low + high) >> 1;
-      if (mobilePageState.chapterPrefix[mid + 1] <= chars) low = mid + 1;
-      else high = mid;
-    }
-    const length = Math.max(1, txtChapters[low]?.content?.length || 1);
-    const within = Math.max(0, Math.min(1,
-      (chars - mobilePageState.chapterPrefix[low]) / length));
-    if (low !== currentTxtChapter) await moveTxtChapter(low, within);
-    else if (isVirtualMobileTxt()) {
-      void virtualTxtSeekRatio(within);
+    // 현재 장에서만 이동합니다. 다른 장을 찾거나 장 전체를 새로 분석하지 않습니다.
+    if (isVirtualMobileTxt()) {
+      await virtualTxtSeekRatio(target);
     } else {
-      finishMobileTxtRender(within);
+      finishMobileTxtRender(target);
       rememberMobileTxtProgress();
     }
   } else {
     try {
-      const locations = epubBook?.locations;
-      if (!mobilePageState.epubLocationsReady || !locations) {
-        mobilePageState.progressLabel.textContent = 'EPUB 위치 계산 중...';
+      if (!epubRendition || !epubBook || !mobilePageState.epubLocation?.start?.cfi)
+        return;
+      if (!mobilePageState.epubLocationsReady) {
+        mobilePageState.progressLabel.textContent = '현재 장 위치 계산 중...';
         const ready = await ensureMobileEpubLocations(epubBook);
         if (!ready || !isMobilePagedReading()) return;
       }
-      const cfi = locations.cfiFromPercentage(target);
-      if (cfi) await epubRendition?.display(cfi);
+      // EPUB에서도 슬라이더는 현재 spine(장) 범위 안에서만 이동합니다.
+      const cfiList = mobileEpubChapterCfis();
+      if (cfiList.length) {
+        const index = Math.min(cfiList.length - 1,
+          Math.floor(target * cfiList.length));
+        await epubRendition.display(cfiList[index]);
+      } else {
+        // 현재 장의 CFI 위치 목록을 만들 수 없으면 잘못된 다른 장으로 넘기지 않습니다.
+        mobilePageState.progressLabel.textContent =
+          '이 EPUB은 현재 장 안에서 위치 이동을 지원하지 않습니다.';
+        return;
+      }
     } catch (error) {
-      console.warn('EPUB 이동 실패', error);
+      console.warn('EPUB 장내 이동 실패', error);
     }
   }
   updateMobileProgressDisplay();
