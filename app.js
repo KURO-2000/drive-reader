@@ -208,7 +208,7 @@ window.addEventListener("load", () => {
   void initializeOfflineReaderLibrary().then(async () => {
     const lastId = readerState.lastOpenedBookId;
     const local = readOfflineBookIndex().find(book => book.id === lastId);
-    if (local && !selectedBook && !isMobileReaderDevice()) {
+    if (local && !selectedBook && !isMobileReaderDevice() && !mobileShelfIsOpen) {
       try { await openBook(local); }
       catch (error) { console.warn('저장된 책 빠른 복원 실패', error); }
     }
@@ -413,7 +413,7 @@ async function connectGoogleDrive() {
 
 
     if (
-      !isMobileReaderDevice() && !selectedBook && readerState.lastOpenedBookId
+      !isMobileReaderDevice() && !mobileShelfIsOpen && !selectedBook && readerState.lastOpenedBookId
     ) {
 
       const book =
@@ -492,7 +492,7 @@ async function autoReconnectGoogleDrive() {
 
 
     if (
-      !isMobileReaderDevice() && !selectedBook && readerState.lastOpenedBookId
+      !isMobileReaderDevice() && !mobileShelfIsOpen && !selectedBook && readerState.lastOpenedBookId
     ) {
 
       const book =
@@ -887,6 +887,7 @@ async function loadBooks() {
   const items = await driveListChildren(requestedFolderId);
   // Ignore stale responses when a user rapidly opens another folder.
   if (requestedFolderId !== currentFolderId) return;
+  loadedShelfFolderId = requestedFolderId;
   folders = items.filter(item => item.mimeType === "application/vnd.google-apps.folder");
   books = items.filter(item => item.mimeType !== "application/vnd.google-apps.folder" && /\.(txt|epub)$/i.test(item.name));
   rememberMobileShelfFolder(requestedFolderId, folders, books);
@@ -1227,7 +1228,7 @@ async function multipartUpload(
 
 async function openBook(book) {
 
-  if (isMobileReaderDevice()) hideMobileBookshelf();
+  if (mobileShelfIsOpen) hideMobileBookshelf();
 
   selectedBook =
     book;
@@ -5382,14 +5383,14 @@ window.addEventListener('load', () => initializeReaderBrightness());
 
 
 /* =========================================================
-   v18 · Android PWA 서재 홈
+   v19 · Windows PC + Android PWA 서재 홈
    - Drive 폴더 먼저 표시, 책은 아래 표시
    - 책을 눌러야 렌더링하므로 앱 첫 화면이 가벼움
-   - 모바일에서만 사용하며 PC 독서 방식은 기존대로 유지
+   - PC/모바일 첫 화면 모두 폴더 우선 서재; PC 독서는 세로 스크롤 유지
    - 책 원본은 기존 IndexedDB 오프라인 캐시 재사용
 ========================================================= */
 
-const MOBILE_SHELF_VERSION = 'v18-drive-bookshelf-20261023';
+const MOBILE_SHELF_VERSION = 'v19-responsive-bookshelf-20261023';
 const MOBILE_SHELF_CACHE_PREFIX = 'driveReaderShelfFolder-v18-';
 let mobileShelfRoot = null;
 let mobileShelfIsOpen = false;
@@ -5397,11 +5398,13 @@ let mobileShelfTab = 'all';
 let mobileShelfSearchOpen = false;
 let mobileShelfSearchText = '';
 let mobileShelfLoading = false;
+let loadedShelfFolderId = "";
 let mobileShelfDialog = null;
 let mobileShelfBackMarker = false;
 
 function shouldShowMobileShelf() {
-  return isMobileReaderDevice() && window.matchMedia('(max-width:800px)').matches;
+  // v19: PC와 휴대폰 모두 같은 Drive 서재 화면을 사용합니다.
+  return true;
 }
 
 function mobileShelfCacheKey(folderId) {
@@ -5437,10 +5440,9 @@ function mobileShelfVisibleItems() {
   let visibleFolders = [];
   let visibleBooks = [];
   const currentlyConnected = !!libraryFolderId &&
-    currentFolderId === (currentFolderId || libraryFolderId) && navigator.onLine;
+    loadedShelfFolderId === currentFolderId && navigator.onLine;
 
-  if (currentlyConnected && Array.isArray(folders) && Array.isArray(books) &&
-      mobileShelfTab === 'all') {
+  if (currentlyConnected && Array.isArray(folders) && Array.isArray(books)) {
     visibleFolders = [...folders];
     visibleBooks = [...books];
   } else if (cached) {
@@ -5471,13 +5473,48 @@ function mobileShelfVisibleItems() {
   return {visibleFolders, visibleBooks};
 }
 
+function initializeDesktopShelfReturnButtons() {
+  if (document.getElementById('desktopShelfHomeBtn')) return;
+  if (!sidebar) return;
+
+  const home = document.createElement('button');
+  home.type = 'button';
+  home.id = 'desktopShelfHomeBtn';
+  home.className = 'main-button';
+  home.textContent = '📚 내 서재 (폴더 보기)';
+  home.addEventListener('click', showMobileBookshelf);
+  // 사이드바에서 계속 이용할 수 있는 고정 진입점.
+  sidebar.insertBefore(home, bookSearch?.parentElement === sidebar ? bookSearch : (tocSection?.parentElement === sidebar ? tocSection : null));
+
+  // 기존 사이드바를 접은 경우에도 PC에서 독서 화면 -> 서재로 복귀 가능.
+  const main = document.getElementById('readerMain');
+  if (main) {
+    const shortcut = document.createElement('button');
+    shortcut.type = 'button';
+    shortcut.id = 'desktopShelfShortcut';
+    shortcut.textContent = '📚 서재';
+    shortcut.title = '내 서재로 돌아가기';
+    Object.assign(shortcut.style, {
+      position:'absolute', right:'14px', bottom:'16px', zIndex:'42',
+      background:'#795548', color:'#fff', border:'none', borderRadius:'18px',
+      padding:'8px 15px', fontSize:'14px', boxShadow:'0 2px 8px #0003'
+    });
+    shortcut.addEventListener('click', showMobileBookshelf);
+    main.appendChild(shortcut);
+  }
+
+  const style = document.createElement('style');
+  style.textContent = '@media(max-width:800px){#desktopShelfHomeBtn,#desktopShelfShortcut{display:none!important}}';
+  document.head.appendChild(style);
+}
+
 function createMobileBookshelf() {
   if (mobileShelfRoot || !shouldShowMobileShelf()) return;
   const style = document.createElement('style');
   style.id = 'mobileShelfStyle';
   style.textContent = `
   #mobileBookshelf {display:none}
-  @media(max-width:800px) {
+  /* PC와 휴대폰에 공통으로 적용되는 서재 UI */
     #mobileBookshelf {
       position:fixed; inset:0; z-index:90; display:none; overflow:hidden;
       background:#faf9f7; color:#302a25; font-family:system-ui,-apple-system,'Noto Sans SC',sans-serif;
@@ -5522,9 +5559,28 @@ function createMobileBookshelf() {
     #mobileShelfDialog .shelf-dialog-title {font-weight:750;font-size:17px;margin-bottom:15px;word-break:break-all}
     #mobileShelfDialog .shelf-dialog-option {width:100%;border:0;background:#fff;padding:15px 8px;text-align:left;border-bottom:1px solid #eee;color:#333}
     #mobileShelfDialog .shelf-dialog-close {margin-top:12px;border:0;background:#eee;border-radius:10px;padding:13px;width:100%;color:#333}
-  }
+    @media (min-width:801px) {
+      #mobileBookshelf .shelf-top {padding-top:0}
+      #mobileBookshelf .shelf-navigation,
+      #mobileBookshelf .shelf-tabs {max-width:1100px;width:100%;margin:0 auto}
+      #mobileBookshelf .shelf-navigation {height:76px;padding:0 22px}
+      #mobileBookshelf .shelf-page-title {font-size:26px}
+      #mobileBookshelf .shelf-tabs {padding:0 26px}
+      #mobileBookshelf .shelf-list {width:100%;padding:14px max(20px,calc((100vw - 1040px)/2)) 60px}
+      #mobileBookshelf .shelf-breadcrumb {font-size:14px}
+      #mobileBookshelf .shelf-folder-row {border-radius:12px;margin:4px 0 8px;border:1px solid #eceae7}
+      #mobileBookshelf .shelf-book-row {border-radius:12px;margin:8px 0;border:1px solid #eeeae7;min-height:145px}
+      #mobileBookshelf .shelf-folder-row:hover,
+      #mobileBookshelf .shelf-book-row:hover {background:#f2f0eb}
+      #mobileBookshelf .shelf-bottom {display:none}
+      #mobileShelfDialog {align-items:center;justify-content:center}
+      #mobileShelfDialog .shelf-dialog-sheet {max-width:460px;max-height:76vh;border-radius:18px;padding:25px;}
+    }
   `;
   document.head.appendChild(style);
+
+  // PC 독서 중에도 쉽게 서재 홈으로 돌아올 수 있게 버튼을 추가합니다.
+  initializeDesktopShelfReturnButtons();
 
   mobileShelfRoot = document.createElement('section');
   mobileShelfRoot.id = 'mobileBookshelf';
@@ -5573,7 +5629,7 @@ function createMobileBookshelf() {
   byId('shelfBottomSettings').addEventListener('click', () => openSettings());
   byId('shelfMoreBtn').addEventListener('click', showMobileShelfMainMenu);
   window.addEventListener('popstate', () => {
-    if (shouldShowMobileShelf() && !mobileShelfIsOpen) {
+    if (isMobileReaderDevice() && shouldShowMobileShelf() && !mobileShelfIsOpen) {
       mobileShelfBackMarker = false;
       showMobileBookshelf();
     }
@@ -5583,8 +5639,8 @@ function createMobileBookshelf() {
       void loadBooks().catch(error => console.warn('서재 온라인 갱신 실패', error));
     }
   });
-  mobileShelfIsOpen = true;
-  mobileShelfRoot.classList.add('is-visible');
+  mobileShelfIsOpen = !selectedBook;
+  if (mobileShelfIsOpen) mobileShelfRoot.classList.add('is-visible');
   renderMobileBookshelf();
 }
 
@@ -5712,10 +5768,8 @@ async function navigateShelfTo(folderId,path) {
     renderMobileBookshelf();
     return;
   }
-  if (goingToExisting && readMobileShelfFolderCache(dest)) {
-    renderMobileBookshelf();
-    return;
-  }
+  // 폴더 목록은 캐시를 먼저 표시하지만, 온라인이면 최신 Drive 목록도 갱신합니다.
+  if (goingToExisting && readMobileShelfFolderCache(dest)) renderMobileBookshelf();
   mobileShelfLoading=true;renderMobileBookshelf();
   try { await loadBooks(); }
   catch (error) { console.error('폴더 열기 실패',error); alert('폴더를 열 수 없습니다: '+error.message); }
@@ -5739,7 +5793,7 @@ async function openMobileShelfBook(book) {
   }
   hideMobileBookshelf();
   // Keep Android back navigation inside the PWA.
-  if (!mobileShelfBackMarker) {
+  if (isMobileReaderDevice() && !mobileShelfBackMarker) {
     history.pushState({novelReader:'reading'}, '', location.href);
     mobileShelfBackMarker=true;
   }
@@ -5827,8 +5881,8 @@ function showMobileShelfMainMenu() {
   ]);
 }
 
-// Create the shelf immediately, rather than waiting for OAuth or downloading
-// an entire TXT novel. Mobile starts at the library, desktop stays unchanged.
+// 서재 홈은 모든 화면에서 즉시 열고, 책은 사용자가 선택했을 때만 로딩합니다.
+// Windows는 기존 스크롤 독서를 유지하고 Android는 기존 페이지 넘김을 유지합니다.
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded',createMobileBookshelf,{once:true});
 } else {
