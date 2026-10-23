@@ -5,10 +5,38 @@
 const GOOGLE_CLIENT_ID =
   "380675432822-gkd6ss2s1aj6ca4k9lkv7l4v7vebgb4g.apps.googleusercontent.com";
 
+// Google Drive에서 직접 만든 기존 폴더와 파일도 목록에 표시하고
+// 폴더 간 이동/이름 변경을 지원하려면 전체 Drive 권한이 필요합니다.
+// 이 권한은 최초 1회 사용자가 동의 화면에서 직접 승인합니다.
+const GOOGLE_DRIVE_FULL_SCOPE =
+  "https://www.googleapis.com/auth/drive";
+
 const GOOGLE_SCOPES = [
-  "https://www.googleapis.com/auth/drive.file",
+  GOOGLE_DRIVE_FULL_SCOPE,
   "https://www.googleapis.com/auth/drive.appdata"
 ].join(" ");
+
+const GOOGLE_OAUTH_SCOPE_VERSION_KEY =
+  "driveReaderOAuthPermissionVersion";
+
+const GOOGLE_OAUTH_SCOPE_VERSION =
+  "drive-full-v20-20261023";
+
+function hasFullDrivePermission() {
+  return localStorage.getItem(GOOGLE_OAUTH_SCOPE_VERSION_KEY) ===
+    GOOGLE_OAUTH_SCOPE_VERSION;
+}
+
+function hasGrantedFullDriveScope(scopeValue) {
+  if (!scopeValue) return false;
+  return String(scopeValue).split(/\s+/).includes(GOOGLE_DRIVE_FULL_SCOPE);
+}
+
+function showFolderPermissionNotice() {
+  const note = '기존 Google Drive 폴더를 보려면 Google Drive 연결 후 새 권한을 승인해 주세요.';
+  if (loginStatus) loginStatus.textContent = note;
+  if (googleLoginBtn) googleLoginBtn.textContent = '☁ 기존 Drive 폴더 연결';
+}
 
 const LIBRARY_FOLDER_NAME =
   "Novel Reader Library";
@@ -200,6 +228,7 @@ const mobileBookTitle =
 window.addEventListener("load", () => {
 
   restoreStoredAccessToken();
+  if (!hasFullDrivePermission()) showFolderPermissionNotice();
   restoreLocalReaderState();
   applySettings();
 
@@ -258,15 +287,18 @@ function initGoogle() {
     });
 
 
+  // 이전 drive.file 승인으로 발급된 토큰은 새 폴더 접근에 사용할 수 없습니다.
+  // 사용자 클릭 없이 더 넓은 권한을 요청하지 않습니다.
+  if (!hasFullDrivePermission()) {
+    showFolderPermissionNotice();
+    return;
+  }
+
   if (
     navigator.onLine &&
-    localStorage.getItem(
-      GOOGLE_CONNECTED_KEY
-    ) === "1"
+    localStorage.getItem(GOOGLE_CONNECTED_KEY) === "1"
   ) {
-
     autoReconnectGoogleDrive();
-
   }
 
 }
@@ -284,9 +316,21 @@ function saveAccessTokenResponse(response) {
   }
 
 
-  accessToken =
-    response.access_token;
+  if (!hasGrantedFullDriveScope(response.scope)) {
+    // 거부되거나 범위가 축소된 경우 다음 클릭에서 동의 화면을 다시 요청.
+    localStorage.removeItem(GOOGLE_OAUTH_SCOPE_VERSION_KEY);
+    clearStoredAccessToken();
+    throw new Error(
+      'Drive 전체 접근 권한이 승인되지 않았습니다. 연결 버튼을 눌러 필요한 권한을 허용해 주세요.'
+    );
+  }
 
+  accessToken = response.access_token;
+
+  localStorage.setItem(
+    GOOGLE_OAUTH_SCOPE_VERSION_KEY,
+    GOOGLE_OAUTH_SCOPE_VERSION
+  );
 
   const expiresIn =
     Number(
@@ -299,69 +343,44 @@ function saveAccessTokenResponse(response) {
     expiresIn * 1000;
 
 
-  localStorage.setItem(
-    GOOGLE_ACCESS_TOKEN_KEY,
-    accessToken
-  );
-
-
-  localStorage.setItem(
-    GOOGLE_ACCESS_TOKEN_EXPIRES_KEY,
-    String(expiresAt)
-  );
+  // 전체 Drive 권한의 Bearer 토큰은 영구 localStorage에 저장하지 않습니다.
+  // 현재 브라우저 세션에서만 재사용하고, 다시 접속하면 Google의 재연결을 시도합니다.
+  sessionStorage.setItem(GOOGLE_ACCESS_TOKEN_KEY, accessToken);
+  sessionStorage.setItem(GOOGLE_ACCESS_TOKEN_EXPIRES_KEY, String(expiresAt));
+  localStorage.removeItem(GOOGLE_ACCESS_TOKEN_KEY);
+  localStorage.removeItem(GOOGLE_ACCESS_TOKEN_EXPIRES_KEY);
 
 }
 
 
 function restoreStoredAccessToken() {
+  // 구버전의 drive.file 토큰(로컬 저장)은 절대 재사용하지 않습니다.
+  localStorage.removeItem(GOOGLE_ACCESS_TOKEN_KEY);
+  localStorage.removeItem(GOOGLE_ACCESS_TOKEN_EXPIRES_KEY);
 
-  const storedToken =
-    localStorage.getItem(
-      GOOGLE_ACCESS_TOKEN_KEY
-    );
-
-
-  const storedExpiresAt =
-    Number(
-      localStorage.getItem(
-        GOOGLE_ACCESS_TOKEN_EXPIRES_KEY
-      ) || 0
-    );
-
-
-  if (
-    storedToken &&
-    storedExpiresAt >
-      Date.now() + 30000
-  ) {
-
-    accessToken =
-      storedToken;
-
-    return true;
-
+  if (!hasFullDrivePermission()) {
+    clearStoredAccessToken();
+    return false;
   }
 
-
+  const storedToken = sessionStorage.getItem(GOOGLE_ACCESS_TOKEN_KEY);
+  const expiresAt = Number(
+    sessionStorage.getItem(GOOGLE_ACCESS_TOKEN_EXPIRES_KEY) || 0
+  );
+  if (storedToken && expiresAt > Date.now() + 30000) {
+    accessToken = storedToken;
+    return true;
+  }
   clearStoredAccessToken();
-
   return false;
-
 }
 
-
 function clearStoredAccessToken() {
-
   accessToken = "";
-
-  localStorage.removeItem(
-    GOOGLE_ACCESS_TOKEN_KEY
-  );
-
-  localStorage.removeItem(
-    GOOGLE_ACCESS_TOKEN_EXPIRES_KEY
-  );
-
+  sessionStorage.removeItem(GOOGLE_ACCESS_TOKEN_KEY);
+  sessionStorage.removeItem(GOOGLE_ACCESS_TOKEN_EXPIRES_KEY);
+  localStorage.removeItem(GOOGLE_ACCESS_TOKEN_KEY);
+  localStorage.removeItem(GOOGLE_ACCESS_TOKEN_EXPIRES_KEY);
 }
 
 
@@ -397,7 +416,10 @@ async function connectGoogleDrive() {
     applySettings();
 
     // 독서 화면 복원을 책 목록 네트워크 응답에 묶지 않습니다.
-    void loadBooks().catch(error => console.warn('책 목록 갱신 실패', error));
+    void loadBooks().catch(error => {
+      console.warn('책 목록 갱신 실패', error);
+      if (loginStatus) loginStatus.textContent = 'Drive 폴더 조회 실패: ' + error.message;
+    });
 
     loginStatus.textContent =
       "Google Drive 연결됨";
@@ -460,7 +482,10 @@ async function connectGoogleDrive() {
 
 
 async function autoReconnectGoogleDrive() {
-
+  if (!hasFullDrivePermission()) {
+    showFolderPermissionNotice();
+    return;
+  }
   try {
 
     loginStatus.textContent =
@@ -481,7 +506,10 @@ async function autoReconnectGoogleDrive() {
     applySettings();
 
 
-    void loadBooks().catch(error => console.warn('책 목록 갱신 실패',error));
+    void loadBooks().catch(error => {
+      console.warn('책 목록 갱신 실패', error);
+      if (loginStatus) loginStatus.textContent = 'Drive 폴더 조회 실패: ' + error.message;
+    });
 
 
     loginStatus.textContent =
@@ -545,7 +573,11 @@ async function autoReconnectGoogleDrive() {
 
 
 function authorizeSilently() {
-
+  if (!hasFullDrivePermission()) {
+    return Promise.reject(new Error(
+      '기존 Google Drive 폴더를 인식하려면 Drive 연결 버튼으로 권한을 승인해 주세요.'
+    ));
+  }
   return new Promise(
     (resolve, reject) => {
 
@@ -578,14 +610,12 @@ function authorizeSilently() {
           }
 
 
-          saveAccessTokenResponse(
-            response
-          );
-
-
-          resolve(
-            accessToken
-          );
+          try {
+            saveAccessTokenResponse(response);
+            resolve(accessToken);
+          } catch (error) {
+            reject(error);
+          }
 
         };
 
@@ -634,26 +664,19 @@ function authorize() {
 
           }
 
-          saveAccessTokenResponse(
-            response
-          );
-
-          resolve(
-            accessToken
-          );
+          try {
+            saveAccessTokenResponse(response);
+            resolve(accessToken);
+          } catch (error) {
+            reject(error);
+          }
 
         };
 
 
       tokenClient.requestAccessToken({
-
-        prompt:
-          localStorage.getItem(
-            GOOGLE_CONNECTED_KEY
-          ) === "1"
-            ? ""
-            : "consent"
-
+        // 드라이브 전체 접근을 처음 요청하는 경우에는 반드시 명시적 동의.
+        prompt: hasFullDrivePermission() ? "" : "consent"
       });
 
     }
@@ -888,6 +911,7 @@ async function loadBooks() {
   // Ignore stale responses when a user rapidly opens another folder.
   if (requestedFolderId !== currentFolderId) return;
   loadedShelfFolderId = requestedFolderId;
+  // 전체 Drive 권한으로 기존 Drive 웹 화면에서 만든 폴더도 포함합니다.
   folders = items.filter(item => item.mimeType === "application/vnd.google-apps.folder");
   books = items.filter(item => item.mimeType !== "application/vnd.google-apps.folder" && /\.(txt|epub)$/i.test(item.name));
   rememberMobileShelfFolder(requestedFolderId, folders, books);
@@ -1026,10 +1050,58 @@ async function driveMove(item, isFolder) {
   });
 }
 
+// Google Drive에서 영구 삭제하지 않고, 복구할 수 있도록 휴지통으로 이동합니다.
+// 앱 내부의 오프라인 사본 및 독서 진도 데이터는 삭제하지 않습니다.
+async function driveMoveToTrash(item, isFolder) {
+  if (!item || !item.id) return;
+  if (item.id === libraryFolderId) {
+    alert('내 서재의 최상위 폴더는 이 메뉴에서 삭제할 수 없습니다.');
+    return;
+  }
+  if (!navigator.onLine || !accessToken) {
+    alert('Google Drive 연결 상태에서만 휴지통으로 이동할 수 있습니다.');
+    return;
+  }
+
+  const warning = isFolder
+    ? `「${item.name}」 폴더를 Google Drive 휴지통으로 이동할까요?\n\n폴더 안의 하위 폴더와 소설도 함께 휴지통으로 이동합니다.\nGoogle Drive 휴지통에서 복원할 수 있습니다.`
+    : `「${item.name}」 소설을 Google Drive 휴지통으로 이동할까요?\n\n기기에 오프라인 저장한 사본은 삭제하지 않습니다.\nGoogle Drive 휴지통에서 복원할 수 있습니다.`;
+  if (!confirm(warning)) return;
+
+  await runLibraryAction(async () => {
+    const id = item.id;
+    const query = new URLSearchParams({fields: 'id,name,trashed'});
+    await apiFetch(
+      'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(id) + '?' + query.toString(),
+      {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({trashed: true})
+      }
+    );
+
+    // 현재 읽는 책을 삭제했으면 다음 실행에서 그 책을 다시 열려고 하지 않도록 처리합니다.
+    if (!isFolder && readerState.lastOpenedBookId === id) {
+      readerState.lastOpenedBookId = null;
+      scheduleStateSave();
+    }
+    if (!isFolder && selectedBook?.id === id) {
+      selectedBook = null;
+      txtReader.classList.add('hidden');
+      epubReader.classList.add('hidden');
+      emptyScreen.classList.remove('hidden');
+      updateOfflineSaveButtons();
+    }
+    await loadBooks();
+    alert((isFolder ? '폴더' : '소설') + '를 Google Drive 휴지통으로 이동했습니다.');
+  });
+}
+
 function showLibraryMenu(item, isFolder) {
-  const action = prompt(`「${item.name}」 관리\n1. 이름 변경\n2. 다른 폴더로 이동\n\n번호를 입력하세요.`);
-  if (action === "1") driveRename(item);
-  else if (action === "2") driveMove(item, isFolder);
+  const action = prompt(`「${item.name}」 관리\n1. 이름 변경\n2. 다른 폴더로 이동\n3. 삭제 (Drive 휴지통으로 이동)\n\n번호를 입력하세요.`);
+  if (action === "1") void driveRename(item);
+  else if (action === "2") void driveMove(item, isFolder);
+  else if (action === "3") void driveMoveToTrash(item, isFolder);
 }
 
 bookSearch.addEventListener(
@@ -5390,8 +5462,8 @@ window.addEventListener('load', () => initializeReaderBrightness());
    - 책 원본은 기존 IndexedDB 오프라인 캐시 재사용
 ========================================================= */
 
-const MOBILE_SHELF_VERSION = 'v19-responsive-bookshelf-20261023';
-const MOBILE_SHELF_CACHE_PREFIX = 'driveReaderShelfFolder-v18-';
+const MOBILE_SHELF_VERSION = 'v21-drive-trash-20261023';
+const MOBILE_SHELF_CACHE_PREFIX = 'driveReaderShelfFolder-v20-';
 let mobileShelfRoot = null;
 let mobileShelfIsOpen = false;
 let mobileShelfTab = 'all';
@@ -5558,6 +5630,7 @@ function createMobileBookshelf() {
     #mobileShelfDialog .shelf-dialog-sheet {background:#fff;color:#302a25;width:100%;max-height:77dvh;overflow-y:auto;border-radius:18px 18px 0 0;padding:20px 17px calc(24px + env(safe-area-inset-bottom,0px));box-shadow:0 -6px 22px #0002}
     #mobileShelfDialog .shelf-dialog-title {font-weight:750;font-size:17px;margin-bottom:15px;word-break:break-all}
     #mobileShelfDialog .shelf-dialog-option {width:100%;border:0;background:#fff;padding:15px 8px;text-align:left;border-bottom:1px solid #eee;color:#333}
+    #mobileShelfDialog .shelf-dialog-option.danger {color:#b32632;font-weight:600}
     #mobileShelfDialog .shelf-dialog-close {margin-top:12px;border:0;background:#eee;border-radius:10px;padding:13px;width:100%;color:#333}
     @media (min-width:801px) {
       #mobileBookshelf .shelf-top {padding-top:0}
@@ -5817,6 +5890,7 @@ function openMobileShelfDialog(title,options) {
   sheet.appendChild(shelfMakeNode('div','shelf-dialog-title',title));
   options.forEach(option => {
     const btn=shelfMakeNode('button','shelf-dialog-option',option.label);
+    if (option.danger) btn.classList.add('danger');
     btn.type='button';btn.addEventListener('click',()=>{
       closeMobileShelfDialog();
       void Promise.resolve().then(option.action).catch(err=>{
@@ -5838,7 +5912,8 @@ function showMobileShelfFileMenu(item,isFolder) {
   openMobileShelfDialog(item.name,[
     ...(!isFolder?[{label:'📖 이어서 읽기',action:()=>openMobileShelfBook(item)}]:[]),
     {label:'✎ 이름 변경',action:()=>driveRename(item)},
-    {label:'📂 다른 폴더로 이동',action:()=>showMobileShelfMoveTargets(item,isFolder)}
+    {label:'📂 다른 폴더로 이동',action:()=>showMobileShelfMoveTargets(item,isFolder)},
+    {label:'🗑 삭제 · Google Drive 휴지통',danger:true,action:()=>driveMoveToTrash(item,isFolder)}
   ]);
 }
 
@@ -5876,7 +5951,7 @@ function showMobileShelfMainMenu() {
       if(!accessToken){alert('Google Drive를 연결해 주세요.');return;}
       await loadBooks();
     }},
-    {label:'☁ Google Drive 연결',action:()=>connectGoogleDrive()},
+    {label:hasFullDrivePermission()?'☁ Google Drive 연결':'☁ 기존 Drive 폴더 접근 권한 승인',action:()=>connectGoogleDrive()},
     {label:'⚙ 읽기 설정',action:()=>openSettings()}
   ]);
 }
