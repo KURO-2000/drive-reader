@@ -5,7 +5,7 @@
   "description": "Google Drive TXT EPUB 웹소설 리더",
   "start_url": "./",
   "scope": "./",
-  "display": "fullscreen",
+  "display": "standalone",
   "background_color": "#f6ecd8",
   "theme_color": "#efe0c3",
   "icons": [
