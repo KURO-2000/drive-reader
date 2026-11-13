@@ -2304,10 +2304,39 @@ contentWidthRange.addEventListener(
 );
 
 
+// 앱 본문, 상단 상태 표시줄 및 페이지 바깥쪽 배경색을 같은 색으로 동기화합니다.
+// Android 하단 시스템 내비게이션 바의 실제 색은 OS/브라우저가 결정할 수 있습니다.
+function syncReaderSystemTheme(theme) {
+  const colors = {
+    light: "#ffffff",
+    sepia: "#f6ecd8",
+    green: "#cfe8cf",
+    dark: "#151515"
+  };
+  const color = colors[theme] || colors.sepia;
+
+  // 상태 표시줄의 색이 갱신되지 않는 일부 Chrome 빌드를 고려해
+  // 기존 meta 값을 변경하는 대신, 색이 바뀔 때 새 태그를 붙입니다.
+  const existing = Array.from(document.querySelectorAll('meta[name="theme-color"]'));
+  if (existing.length !== 1 || existing[0].content.toLowerCase() !== color.toLowerCase()) {
+    existing.forEach(node => node.remove());
+    const meta = document.createElement("meta");
+    meta.name = "theme-color";
+    meta.content = color;
+    document.head.appendChild(meta);
+  }
+
+  document.documentElement.style.backgroundColor = color;
+  document.documentElement.style.setProperty("--reader-system-theme", color);
+  // 오버스크롤/안전 영역에 페이지의 현재 배경색이 적용되게 합니다.
+}
+
 function applySettings() {
 
   const settings =
     readerState.settings;
+
+  syncReaderSystemTheme(settings.theme);
 
 
   document.body.classList.remove(
@@ -3208,9 +3237,7 @@ function initializeMobilePagedReading() {
       #mobileReaderUi {
         display:none;
         position:fixed;
-        top:0; left:0; right:0; bottom:auto;
-        height:100dvh; max-height:100dvh;
-        box-sizing:border-box;
+        inset:0;
         z-index:2000;
         pointer-events:none;
         font-family:Arial, 'Noto Sans KR', 'Noto Sans SC', sans-serif;
@@ -3296,7 +3323,7 @@ function initializeMobilePagedReading() {
 
   const ui = document.createElement('div');
   ui.id = 'mobileReaderUi';
-  ui.dataset.readerVersion = 'v23-chapter-pages';
+  ui.dataset.readerVersion = 'v24-theme-bars';
   ui.setAttribute('aria-label', '휴대폰 독서 메뉴');
   ui.innerHTML = `
     <div class="mobile-reader-top">
@@ -4465,12 +4492,11 @@ document.documentElement.dataset.readerBuild = 'v16-cloud-priority';
   const link = document.createElement("link");
   link.rel = "manifest";
   link.href = isMobileReaderDevice()
-    ? "./manifest-android.webmanifest?v=23_1"
-    : "./manifest.webmanifest?v=23_1";
+    ? "./manifest-android.webmanifest?v=24"
+    : "./manifest.webmanifest?v=24";
   document.head.appendChild(link);
-  const meta = document.createElement("meta");
-  meta.name = "theme-color"; meta.content = "#efe0c3";
-  document.head.appendChild(meta);
+  // 이전 버전의 고정 베이지 테마색 대신 현재 읽기 테마를 사용합니다.
+  syncReaderSystemTheme(readerState.settings.theme);
   const style = document.createElement("style");
   style.textContent = `
     .library-controls { display:flex; gap:6px; margin:8px 0; flex-wrap:wrap; }
@@ -4483,12 +4509,12 @@ document.documentElement.dataset.readerBuild = 'v16-cloud-priority';
   document.head.appendChild(style);
   if ("serviceWorker" in navigator && location.protocol === "https:") {
     window.addEventListener("load", () => {
-      navigator.serviceWorker.register("./sw.js?v=16").then(reg => {
+      navigator.serviceWorker.register("./sw.js?v=24").then(reg => {
         reg.update().catch(() => {});
         // 강제로 캐시를 삭제하지 않고 새 서비스 워커 활성화 후 한 번만 다시 읽습니다.
         navigator.serviceWorker.addEventListener('controllerchange', () => {
-          if (sessionStorage.getItem('reader-v16-updated') !== '1') {
-            sessionStorage.setItem('reader-v16-updated','1');
+          if (sessionStorage.getItem('reader-v24-theme-bars-updated') !== '1') {
+            sessionStorage.setItem('reader-v24-theme-bars-updated','1');
             location.reload();
           }
         });
@@ -5627,9 +5653,7 @@ function createMobileBookshelf() {
   #mobileBookshelf {display:none}
   /* PC와 휴대폰에 공통으로 적용되는 서재 UI */
     #mobileBookshelf {
-      position:fixed; top:0; left:0; right:0; bottom:auto;
-      width:100%; height:100dvh; max-height:100dvh;
-      box-sizing:border-box; z-index:90; display:none; overflow:hidden;
+      position:fixed; inset:0; z-index:90; display:none; overflow:hidden;
       background:#faf9f7; color:#302a25; font-family:system-ui,-apple-system,'Noto Sans SC',sans-serif;
       --shelf-accent:#bb4a41; --shelf-header:#795548;
     }
@@ -5662,7 +5686,7 @@ function createMobileBookshelf() {
     #mobileBookshelf .shelf-book-title {font-size:18px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-all;color:#252525}
     #mobileBookshelf .shelf-book-meta {font-size:13px;color:#8c8985;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     #mobileBookshelf .shelf-offline-tag {font-size:12px;color:#568b64;background:#e4f3e7;border-radius:99px;padding:3px 7px;align-self:flex-start}
-    #mobileBookshelf .shelf-bottom {padding:8px 0 max(8px, env(safe-area-inset-bottom,0px));min-height:66px;height:auto;box-sizing:border-box;flex-shrink:0;background:#f3f2f0;border-top:1px solid #ddd8d3;display:flex;align-items:center;justify-content:space-around}
+    #mobileBookshelf .shelf-bottom {padding-bottom:env(safe-area-inset-bottom,0px);height:66px;box-sizing:content-box;flex-shrink:0;background:#f3f2f0;border-top:1px solid #ddd8d3;display:flex;align-items:center;justify-content:space-around}
     #mobileBookshelf .shelf-bottom button {border:0;background:none;color:#706b67;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:3px;font-size:11px;min-width:80px}
     #mobileBookshelf .shelf-bottom button span {font-size:22px;line-height:1.1}
     #mobileBookshelf .shelf-bottom button.active {color:#c1483e;font-weight:700}
