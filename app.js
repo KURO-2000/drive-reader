@@ -3208,7 +3208,9 @@ function initializeMobilePagedReading() {
       #mobileReaderUi {
         display:none;
         position:fixed;
-        inset:0;
+        top:0; left:0; right:0; bottom:auto;
+        height:100dvh; max-height:100dvh;
+        box-sizing:border-box;
         z-index:2000;
         pointer-events:none;
         font-family:Arial, 'Noto Sans KR', 'Noto Sans SC', sans-serif;
@@ -4463,8 +4465,8 @@ document.documentElement.dataset.readerBuild = 'v16-cloud-priority';
   const link = document.createElement("link");
   link.rel = "manifest";
   link.href = isMobileReaderDevice()
-    ? "./manifest-android.webmanifest?v=10"
-    : "./manifest.webmanifest?v=10";
+    ? "./manifest-android.webmanifest?v=23_1"
+    : "./manifest.webmanifest?v=23_1";
   document.head.appendChild(link);
   const meta = document.createElement("meta");
   meta.name = "theme-color"; meta.content = "#efe0c3";
@@ -5625,7 +5627,9 @@ function createMobileBookshelf() {
   #mobileBookshelf {display:none}
   /* PC와 휴대폰에 공통으로 적용되는 서재 UI */
     #mobileBookshelf {
-      position:fixed; inset:0; z-index:90; display:none; overflow:hidden;
+      position:fixed; top:0; left:0; right:0; bottom:auto;
+      width:100%; height:100dvh; max-height:100dvh;
+      box-sizing:border-box; z-index:90; display:none; overflow:hidden;
       background:#faf9f7; color:#302a25; font-family:system-ui,-apple-system,'Noto Sans SC',sans-serif;
       --shelf-accent:#bb4a41; --shelf-header:#795548;
     }
@@ -5658,7 +5662,7 @@ function createMobileBookshelf() {
     #mobileBookshelf .shelf-book-title {font-size:18px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-all;color:#252525}
     #mobileBookshelf .shelf-book-meta {font-size:13px;color:#8c8985;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     #mobileBookshelf .shelf-offline-tag {font-size:12px;color:#568b64;background:#e4f3e7;border-radius:99px;padding:3px 7px;align-self:flex-start}
-    #mobileBookshelf .shelf-bottom {padding-bottom:env(safe-area-inset-bottom,0px);height:66px;box-sizing:content-box;flex-shrink:0;background:#f3f2f0;border-top:1px solid #ddd8d3;display:flex;align-items:center;justify-content:space-around}
+    #mobileBookshelf .shelf-bottom {padding:8px 0 max(8px, env(safe-area-inset-bottom,0px));min-height:66px;height:auto;box-sizing:border-box;flex-shrink:0;background:#f3f2f0;border-top:1px solid #ddd8d3;display:flex;align-items:center;justify-content:space-around}
     #mobileBookshelf .shelf-bottom button {border:0;background:none;color:#706b67;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:3px;font-size:11px;min-width:80px}
     #mobileBookshelf .shelf-bottom button span {font-size:22px;line-height:1.1}
     #mobileBookshelf .shelf-bottom button.active {color:#c1483e;font-weight:700}
