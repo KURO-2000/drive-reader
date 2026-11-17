@@ -86,6 +86,96 @@ const AUTO_DISGUISE_DELAY_MS =
 
 let autoDisguiseTimer = null;
 
+// Kuro Reader v7: web and Android keep different last-read positions.
+// The website owns reader-state.json; Android owns reader-app-progress.json.
+// The website only READS the Android file and never writes it.
+const APP_PROGRESS_FILE_NAME = 'reader-app-progress.json';
+let appProgressDriveFileId = null;
+let lastAppProgressReadAt = 0;
+let appReadingProgressSnapshot = {txtProgress:{}, epubProgress:{}};
+
+function compareFurthestTxtProgress(a, b) {
+  if (!a) return b ? -1 : 0;
+  if (!b) return 1;
+  const ca = Number(a.chapterIndex ?? 0);
+  const cb = Number(b.chapterIndex ?? 0);
+  if (ca !== cb) return Math.sign(ca - cb);
+  const oa = Number(a.charOffset ?? 0), ob = Number(b.charOffset ?? 0);
+  if (oa > 0 && ob > 0 && oa !== ob) return Math.sign(oa - ob);
+  const ra = Number(a.pageRatio ?? a.scrollRatio ?? 0);
+  const rb = Number(b.pageRatio ?? b.scrollRatio ?? 0);
+  if (Number.isFinite(ra) && Number.isFinite(rb) && Math.abs(ra-rb) > 0.005)
+    return Math.sign(ra-rb);
+  return Math.sign(oa - ob);
+}
+
+function furthestTxtProgress(sitePosition, appPosition) {
+  if (!appPosition) return sitePosition || {};
+  if (!sitePosition) return appPosition;
+  return compareFurthestTxtProgress(sitePosition, appPosition) >= 0
+    ? sitePosition : appPosition;
+}
+
+// Compare EPUB CFI paths only when they use the same standard EPUB-CFI format.
+function compareEpubProgressCFI(a, b) {
+  function path(cfi) {
+    if (typeof cfi !== 'string' || !cfi.startsWith('epubcfi(')) return null;
+    const numbers = [...cfi.replace(/\[[^\]]*\]/g, '').matchAll(/[/!:](\d+)/g)]
+      .map(m => Number(m[1]));
+    return numbers.length ? numbers : null;
+  }
+  const x = path(a?.cfi), y = path(b?.cfi);
+  if (!x || !y) return null;
+  for (let i=0; i<Math.min(x.length,y.length); i++) {
+    if (x[i] !== y[i]) return Math.sign(x[i]-y[i]);
+  }
+  return Math.sign(x.length-y.length);
+}
+
+async function refreshAppProgressFromDrive({force=false} = {}) {
+  if (!navigator.onLine || !accessToken) return false;
+  if (!force && Date.now() - lastAppProgressReadAt < 10000) return true;
+  try {
+    if (!appProgressDriveFileId) {
+      const query = new URLSearchParams({
+        spaces:'appDataFolder',
+        q:`name='${APP_PROGRESS_FILE_NAME}' and trashed=false`,
+        fields:'files(id,name)',pageSize:'100'
+      });
+      const result = await apiFetch('https://www.googleapis.com/drive/v3/files?'+query);
+      const info = await result.json();
+      appProgressDriveFileId = info.files?.[0]?.id || '';
+    }
+    if (appProgressDriveFileId) {
+      const result = await apiFetch('https://www.googleapis.com/drive/v3/files/'+
+        encodeURIComponent(appProgressDriveFileId)+'?alt=media');
+      const file = await result.json();
+      appReadingProgressSnapshot = {
+        txtProgress: file?.txtProgress || {},
+        epubProgress: file?.epubProgress || {}
+      };
+    } else {
+      appReadingProgressSnapshot = {txtProgress:{},epubProgress:{}};
+    }
+    lastAppProgressReadAt = Date.now();
+    return true;
+  } catch (error) {
+    console.warn('앱 독서 위치 불러오기 실패 (사이트 위치 사용)', error);
+    return false;
+  }
+}
+
+function scheduleSiteChapterCheckpoint() {
+  // Every chapter transition is an explicit local checkpoint, even if the
+  // browser missed a recent touch/pointer event. Store before network upload.
+  readerUserActionUntil = Date.now() + 4000;
+  scheduleStateSave();
+  if (navigator.onLine && cloudReaderStateReady && accessToken) {
+    clearTimeout(stateSaveTimer);
+    stateSaveTimer = setTimeout(() => { void saveState(); }, 80);
+  }
+}
+
 let readerState = {
 
   settings: {
@@ -1299,6 +1389,11 @@ async function multipartUpload(
 ========================================================= */
 
 async function openBook(book) {
+  // Read the Android slot for this book before opening it.  No sync is
+  // required when offline: keep the website's own stored location.
+  if (navigator.onLine && accessToken) {
+    await refreshAppProgressFromDrive({force:true});
+  }
 
   // 사이드바나 오프라인 목록에서 직접 연 책도 Android 뒤로가기를 보장합니다.
   if (isMobileReaderDevice()) registerMobileReadingBackEntry();
@@ -1430,7 +1525,7 @@ async function openTxtBook(book) {
   }
   if (!stored) {
     const response = await downloadDriveFile(book.id);
-    const text = await response.text();
+    const text = await decodeNovelTxtResponse(response);
     stored = splitTxtIntoChapters(text);
     if (localBook?.blob) {
       await writeReaderCacheRecord(TXT_PARSED_STORE, {
@@ -1443,11 +1538,16 @@ async function openTxtBook(book) {
   buildMobileTxtLengthIndex();
 
 
-  const progress =
-    readerState
-      .txtProgress[
-        book.id
-      ] || {};
+  const originalSiteProgress = readerState.txtProgress[book.id] || null;
+  const appTxtPosition = (navigator.onLine && accessToken)
+    ? appReadingProgressSnapshot.txtProgress[book.id] : null;
+  const progress = furthestTxtProgress(originalSiteProgress, appTxtPosition);
+  const openedFurtherThanSite = !!appTxtPosition &&
+    (!originalSiteProgress || compareFurthestTxtProgress(
+      appTxtPosition, originalSiteProgress) > 0);
+  // The website is now displaying this location. Its own last-read pointer
+  // may advance, but this does NOT write into Android's separate slot.
+  readerState.txtProgress[book.id] = {...progress};
 
 
   currentTxtChapter =
@@ -1466,6 +1566,9 @@ async function openTxtBook(book) {
       (progress.scrollRatio || 0)
   );
 
+  // Opening a later app location counts as reaching that chapter on the web.
+  // Save the site's own checkpoint without changing the app progress file.
+  if (openedFurtherThanSite) scheduleSiteChapterCheckpoint();
 
   renderTxtToc();
 
@@ -1481,6 +1584,47 @@ async function openTxtBook(book) {
 
 }
 
+
+/* =========================================================
+   TXT 인코딩 자동 인식 (UTF-8 -> GB18030 -> GBK)
+   원본 bytes에서 디코딩해야 잘못된 U+FFFD(�) 치환을 막을 수 있습니다.
+   HTML / EPUB / Google Drive 상태 JSON에는 적용하지 않습니다.
+========================================================= */
+function decodeNovelTxtBytes(input) {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+
+  // BOM은 인코딩의 명시적인 힌트이므로 우선 처리합니다.
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return new TextDecoder('utf-16le', {fatal: true}).decode(bytes);
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    return new TextDecoder('utf-16be', {fatal: true}).decode(bytes);
+  }
+
+  // fatal=true가 핵심입니다. 잘못된 UTF-8을 �로 바꾸지 않고 거부합니다.
+  // 브라우저가 지원하는 중국어 인코딩도 순서대로 시도합니다.
+  for (const encoding of ['utf-8', 'gb18030', 'gbk']) {
+    try {
+      const text = new TextDecoder(encoding, {fatal: true}).decode(bytes);
+      // 인코딩 자체가 성공해도 이미 깨져 저장된 원본은 복구할 수 없습니다.
+      return text;
+    } catch (error) {
+      console.debug('[TXT] 다른 인코딩 시도:', encoding, error.message);
+    }
+  }
+
+  // 비표준/부분 손상 파일은 우선 중국어를 최대한 살려서 보여줍니다.
+  console.warn('[TXT] 인코딩 자동 인식 실패. GB18030 대체 디코딩 사용');
+  try {
+    return new TextDecoder('gb18030').decode(bytes);
+  } catch (_) {
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+}
+
+async function decodeNovelTxtResponse(response) {
+  return decodeNovelTxtBytes(await response.arrayBuffer());
+}
 
 /* =========================================================
    TXT 자동 장 분리
@@ -1817,8 +1961,9 @@ async function moveTxtChapter(
   if (isVirtualMobileTxt()) virtualTxtEpoch++;
   renderTxtChapter(restoreRatio);
 
-
-  scheduleStateSave();
+  // Save a chapter boundary immediately on-device, then upload shortly
+  // afterward when Internet is available.
+  scheduleSiteChapterCheckpoint();
 
 }
 
@@ -1993,11 +2138,14 @@ async function openEpubBook(
   );
 
 
-  const progress =
-    readerState
-      .epubProgress[
-        book.id
-      ] || {};
+  const websiteEpubProgress = readerState.epubProgress[book.id] || {};
+  const appEpubProgress = (navigator.onLine && accessToken)
+    ? appReadingProgressSnapshot.epubProgress[book.id] : null;
+  const epubOrder = compareEpubProgressCFI(appEpubProgress, websiteEpubProgress);
+  const progress = appEpubProgress &&
+    (!websiteEpubProgress.cfi || (epubOrder !== null && epubOrder > 0))
+    ? appEpubProgress : websiteEpubProgress;
+  readerState.epubProgress[book.id] = {...progress};
 
 
   epubRendition.on("relocated", location => {
@@ -4882,7 +5030,7 @@ const OFFLINE_READER_DB = "drive-novel-offline-v1";
 const OFFLINE_READER_STORE = "books";
 const TXT_PARSED_STORE = "txtChapters";
 const TXT_LAYOUT_STORE = "txtLayouts";
-const TXT_CACHE_FORMAT_VERSION = 14;
+const TXT_CACHE_FORMAT_VERSION = 15; // 인코딩 수정 전 깨진 TXT 캐시 무효화
 const OFFLINE_BOOK_INDEX_KEY = "driveReaderOfflineBookIndexV1";
 const OFFLINE_LOCAL_STATE_KEY = "driveReaderLastLocalStateV1";
 const OFFLINE_PENDING_STATE_KEY = "driveReaderPendingSyncV1";
@@ -5025,7 +5173,7 @@ async function saveCurrentBookOffline() {
     if (originalBookName.toLowerCase().endsWith('.txt')) {
       // 최초 다운로드에서 장 분리는 단 한 번 수행하고 결과를 영구 보관합니다.
       // 다음 실행부터는 거대한 원본 TXT를 다시 읽거나 정규식으로 분리하지 않습니다.
-      const text = await blob.text();
+      const text = decodeNovelTxtBytes(await blob.arrayBuffer());
       const chapters = splitTxtIntoChapters(text);
       await writeReaderCacheRecord(TXT_PARSED_STORE, {
         id: originalBookId, savedAt, version: TXT_CACHE_FORMAT_VERSION,
