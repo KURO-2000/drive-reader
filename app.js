@@ -1,65 +1,25 @@
 /* =========================================================
-   GOOGLE 설정
+   v28: Cloudflare Worker 서버 연결 (Google OAuth는 서버에서만 사용)
+   GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, PAIRING_KEY는 여기에 넣지 않습니다.
 ========================================================= */
-
-const GOOGLE_CLIENT_ID =
-  "380675432822-gkd6ss2s1aj6ca4k9lkv7l4v7vebgb4g.apps.googleusercontent.com";
-
-// Google Drive에서 직접 만든 기존 폴더와 파일도 목록에 표시하고
-// 폴더 간 이동/이름 변경을 지원하려면 전체 Drive 권한이 필요합니다.
-// 이 권한은 최초 1회 사용자가 동의 화면에서 직접 승인합니다.
-const GOOGLE_DRIVE_FULL_SCOPE =
-  "https://www.googleapis.com/auth/drive";
-
-const GOOGLE_SCOPES = [
-  GOOGLE_DRIVE_FULL_SCOPE,
-  "https://www.googleapis.com/auth/drive.appdata"
-].join(" ");
-
-const GOOGLE_OAUTH_SCOPE_VERSION_KEY =
-  "driveReaderOAuthPermissionVersion";
-
-const GOOGLE_OAUTH_SCOPE_VERSION =
-  "drive-full-v20-20261023";
+const WORKER_API_URL = 'https://kuro-reader-api.piaojiaolin.workers.dev';
+const readerApi = new KuroWorkerClient(WORKER_API_URL);
+const LIBRARY_FOLDER_NAME = 'Novel Reader Library';
 
 function hasFullDrivePermission() {
-  return localStorage.getItem(GOOGLE_OAUTH_SCOPE_VERSION_KEY) ===
-    GOOGLE_OAUTH_SCOPE_VERSION;
+  return !!readerApi.token;
 }
-
-function hasGrantedFullDriveScope(scopeValue) {
-  if (!scopeValue) return false;
-  return String(scopeValue).split(/\s+/).includes(GOOGLE_DRIVE_FULL_SCOPE);
-}
-
 function showFolderPermissionNotice() {
-  const note = '기존 Google Drive 폴더를 보려면 Google Drive 연결 후 새 권한을 승인해 주세요.';
-  if (loginStatus) loginStatus.textContent = note;
-  if (googleLoginBtn) googleLoginBtn.textContent = '☁ 기존 Drive 폴더 연결';
+  if (loginStatus) loginStatus.textContent = '서버 연결을 누르고 기기 연결 코드를 입력해 주세요.';
+  if (googleLoginBtn) googleLoginBtn.textContent = '☁ 서버 연결';
 }
-
-const LIBRARY_FOLDER_NAME =
-  "Novel Reader Library";
-
-const STATE_FILE_NAME =
-  "reader-state.json";
-
-const GOOGLE_CONNECTED_KEY =
-  "driveReaderGoogleConnected";
-
-const GOOGLE_ACCESS_TOKEN_KEY =
-  "driveReaderGoogleAccessToken";
-
-const GOOGLE_ACCESS_TOKEN_EXPIRES_KEY =
-  "driveReaderGoogleAccessTokenExpires";
 
 
 /* =========================================================
    상태
 ========================================================= */
 
-let tokenClient = null;
-let accessToken = "";
+let accessToken = readerApi.token || '';
 
 let libraryFolderId = "";
 let stateFileId = "";
@@ -132,37 +92,9 @@ function compareEpubProgressCFI(a, b) {
   return Math.sign(x.length-y.length);
 }
 
-async function refreshAppProgressFromDrive({force=false} = {}) {
-  if (!navigator.onLine || !accessToken) return false;
-  if (!force && Date.now() - lastAppProgressReadAt < 10000) return true;
-  try {
-    if (!appProgressDriveFileId) {
-      const query = new URLSearchParams({
-        spaces:'appDataFolder',
-        q:`name='${APP_PROGRESS_FILE_NAME}' and trashed=false`,
-        fields:'files(id,name)',pageSize:'100'
-      });
-      const result = await apiFetch('https://www.googleapis.com/drive/v3/files?'+query);
-      const info = await result.json();
-      appProgressDriveFileId = info.files?.[0]?.id || '';
-    }
-    if (appProgressDriveFileId) {
-      const result = await apiFetch('https://www.googleapis.com/drive/v3/files/'+
-        encodeURIComponent(appProgressDriveFileId)+'?alt=media');
-      const file = await result.json();
-      appReadingProgressSnapshot = {
-        txtProgress: file?.txtProgress || {},
-        epubProgress: file?.epubProgress || {}
-      };
-    } else {
-      appReadingProgressSnapshot = {txtProgress:{},epubProgress:{}};
-    }
-    lastAppProgressReadAt = Date.now();
-    return true;
-  } catch (error) {
-    console.warn('앱 독서 위치 불러오기 실패 (사이트 위치 사용)', error);
-    return false;
-  }
+// D1에서 해당 책의 web/app 기록을 한번에 읽는 함수의 호환 래퍼.
+async function refreshAppProgressFromDrive({force=false, bookId=null} = {}) {
+  return refreshReaderStateFromDrive({bookId, applyToOpenedBook:false});
 }
 
 function scheduleSiteChapterCheckpoint() {
@@ -312,585 +244,121 @@ const mobileBookTitle =
 
 
 /* =========================================================
-   초기화
+   v28: 기기 연결 코드 한 번만 입력, 다음부터는 토큰으로 자동 연결.
+   PC 시크릿 창은 종료되면 로컬 토큰이 사라질 수 있습니다.
 ========================================================= */
-
-window.addEventListener("load", () => {
-
-  restoreStoredAccessToken();
-  if (!hasFullDrivePermission()) showFolderPermissionNotice();
+window.addEventListener('load', () => {
+  accessToken = readerApi.token || '';
   restoreLocalReaderState();
   applySettings();
-
-  // 저장된 책부터 즉시 열고, Google Drive 연결은 뒤에서 시도합니다.
-  // 로그인/네트워크가 늦어도 독서 화면이 먼저 준비됩니다.
+  if (!accessToken) showFolderPermissionNotice();
   void initializeOfflineReaderLibrary().then(async () => {
     const lastId = readerState.lastOpenedBookId;
     const local = readOfflineBookIndex().find(book => book.id === lastId);
     if (local && !selectedBook && !isMobileReaderDevice() && !mobileShelfIsOpen) {
       try { await openBook(local); }
-      catch (error) { console.warn('저장된 책 빠른 복원 실패', error); }
+      catch (error) { console.warn('저장된 책 빠른 복원 실패',error); }
     }
-  }).catch(error => console.warn('오프라인 서재 초기화 실패', error));
-  if (navigator.onLine) setTimeout(waitForGoogle, 150);
-
+  }).catch(error => console.warn('오프라인 서재 초기화 실패',error));
+  if (navigator.onLine && readerApi.token) {
+    void connectWorkerDrive({silent:true});
+  }
 });
 
-
-function waitForGoogle() {
-
-  if (!navigator.onLine) return;
-
-  if (
-    window.google &&
-    google.accounts &&
-    google.accounts.oauth2
-  ) {
-
-    initGoogle();
-
-    return;
-  }
-
-  setTimeout(
-    waitForGoogle,
-    300
-  );
-
-}
-
-
-function initGoogle() {
-
-  tokenClient =
-    google.accounts.oauth2.initTokenClient({
-
-      client_id:
-        GOOGLE_CLIENT_ID,
-
-      scope:
-        GOOGLE_SCOPES,
-
-      callback:
-        () => {}
-
+function requestPairingKey() {
+  return new Promise(resolve => {
+    const backdrop = document.createElement('div');
+    Object.assign(backdrop.style, {
+      position:'fixed',inset:'0',zIndex:'2147483646',background:'rgba(0,0,0,.55)',
+      display:'flex',alignItems:'center',justifyContent:'center',padding:'18px'
     });
-
-
-  // 이전 drive.file 승인으로 발급된 토큰은 새 폴더 접근에 사용할 수 없습니다.
-  // 사용자 클릭 없이 더 넓은 권한을 요청하지 않습니다.
-  if (!hasFullDrivePermission()) {
-    showFolderPermissionNotice();
-    return;
-  }
-
-  if (
-    navigator.onLine &&
-    localStorage.getItem(GOOGLE_CONNECTED_KEY) === "1"
-  ) {
-    autoReconnectGoogleDrive();
-  }
-
+    const panel = document.createElement('form');
+    Object.assign(panel.style, {
+      boxSizing:'border-box',width:'100%',maxWidth:'440px',padding:'22px',
+      borderRadius:'12px',background:'#fff',color:'#222',fontFamily:'system-ui,sans-serif',
+      boxShadow:'0 12px 30px rgba(0,0,0,.25)'
+    });
+    const title=document.createElement('h3');
+    title.textContent='Cloudflare 서버 연결';
+    title.style.margin='0 0 12px';
+    const help=document.createElement('p');
+    help.textContent='Cloudflare에서 설정한 PAIRING_KEY를 입력해 주세요. 이 코드는 저장하지 않고 서버로 한 번만 전송합니다.';
+    help.style.cssText='font-size:13px;line-height:1.6;';
+    const input=document.createElement('input');
+    input.type='password'; input.autocomplete='off';input.required=true;
+    input.placeholder='기기 연결 코드';
+    input.style.cssText='width:100%;box-sizing:border-box;padding:11px;border:1px solid #aaa;border-radius:6px;color:#222;background:#fff;';
+    const actions=document.createElement('div');
+    actions.style.cssText='display:flex;justify-content:flex-end;gap:9px;margin-top:16px;';
+    const cancel=document.createElement('button');
+    cancel.type='button';cancel.textContent='취소';
+    const ok=document.createElement('button');ok.type='submit';ok.textContent='연결';
+    for(const button of [cancel,ok])button.style.cssText='padding:9px 16px;border:1px solid #aaa;border-radius:6px;cursor:pointer;';
+    const done=value=>{backdrop.remove();resolve(value);};
+    cancel.onclick=()=>done('');
+    backdrop.addEventListener('click',e=>{if(e.target===backdrop)done('');});
+    panel.addEventListener('submit',e=>{e.preventDefault();done(input.value.trim());});
+    panel.append(title,help,input,actions);actions.append(cancel,ok);
+    backdrop.append(panel);document.body.append(backdrop);input.focus();
+  });
 }
 
-
-function saveAccessTokenResponse(response) {
-
-  if (
-    !response ||
-    !response.access_token
-  ) {
-
-    return;
-
-  }
-
-
-  if (!hasGrantedFullDriveScope(response.scope)) {
-    // 거부되거나 범위가 축소된 경우 다음 클릭에서 동의 화면을 다시 요청.
-    localStorage.removeItem(GOOGLE_OAUTH_SCOPE_VERSION_KEY);
-    clearStoredAccessToken();
-    throw new Error(
-      'Drive 전체 접근 권한이 승인되지 않았습니다. 연결 버튼을 눌러 필요한 권한을 허용해 주세요.'
-    );
-  }
-
-  accessToken = response.access_token;
-
-  localStorage.setItem(
-    GOOGLE_OAUTH_SCOPE_VERSION_KEY,
-    GOOGLE_OAUTH_SCOPE_VERSION
-  );
-
-  const expiresIn =
-    Number(
-      response.expires_in || 3600
-    );
-
-
-  const expiresAt =
-    Date.now() +
-    expiresIn * 1000;
-
-
-  // 전체 Drive 권한의 Bearer 토큰은 영구 localStorage에 저장하지 않습니다.
-  // 현재 브라우저 세션에서만 재사용하고, 다시 접속하면 Google의 재연결을 시도합니다.
-  sessionStorage.setItem(GOOGLE_ACCESS_TOKEN_KEY, accessToken);
-  sessionStorage.setItem(GOOGLE_ACCESS_TOKEN_EXPIRES_KEY, String(expiresAt));
-  localStorage.removeItem(GOOGLE_ACCESS_TOKEN_KEY);
-  localStorage.removeItem(GOOGLE_ACCESS_TOKEN_EXPIRES_KEY);
-
-}
-
-
-function restoreStoredAccessToken() {
-  // 구버전의 drive.file 토큰(로컬 저장)은 절대 재사용하지 않습니다.
-  localStorage.removeItem(GOOGLE_ACCESS_TOKEN_KEY);
-  localStorage.removeItem(GOOGLE_ACCESS_TOKEN_EXPIRES_KEY);
-
-  if (!hasFullDrivePermission()) {
-    clearStoredAccessToken();
-    return false;
-  }
-
-  const storedToken = sessionStorage.getItem(GOOGLE_ACCESS_TOKEN_KEY);
-  const expiresAt = Number(
-    sessionStorage.getItem(GOOGLE_ACCESS_TOKEN_EXPIRES_KEY) || 0
-  );
-  if (storedToken && expiresAt > Date.now() + 30000) {
-    accessToken = storedToken;
+let workerConnectPromise=null;
+async function connectWorkerDrive({silent=false}={}) {
+  if(workerConnectPromise)return workerConnectPromise;
+  workerConnectPromise=(async()=>{
+    if(!navigator.onLine) {if(!silent)alert('인터넷 연결이 필요합니다.');return false;}
+    loginStatus.textContent='Cloudflare 서버 연결 중...';
+    if(!readerApi.token){
+      if(silent)return false;
+      const code=await requestPairingKey();
+      if(!code){showFolderPermissionNotice();return false;}
+      await readerApi.pair(code,'Kuro Reader website');
+    }
+    let result;
+    try { result=await readerApi.status(); }
+    catch(error){
+      if(/기기 연결이 필요|401|토큰|다시 기기 등록/.test(error.message)) {
+        readerApi.forget();accessToken='';
+        showFolderPermissionNotice();
+      }
+      throw error;
+    }
+    accessToken=readerApi.token;
+    libraryFolderId=result.library?.id || '';
+    if(!libraryFolderId)throw new Error('서버에서 Novel Reader Library 폴더를 확인하지 못했습니다.');
+    if(!currentFolderId)currentFolderId=libraryFolderId;
+    cloudReaderStateReady=true;
+    try{await loadState();}catch(error){console.warn('읽던 위치 복원 지연',error);}
+    applySettings();
+    await loadBooks();
+    loginStatus.textContent='☁ Cloudflare 서버 연결됨';
+    googleLoginBtn.textContent='✓ 서버 연결됨';
+    if(!isMobileReaderDevice() && !mobileShelfIsOpen && !selectedBook && readerState.lastOpenedBookId){
+      const book=books.find(b=>b.id===readerState.lastOpenedBookId) ||
+        readOfflineBookIndex().find(b=>b.id===readerState.lastOpenedBookId);
+      if(book){try{await openBook(book);}catch(error){console.warn('독서 위치 복원 실패',error);}}
+    }
+    if(hasPendingReaderSync())setTimeout(()=>{void saveState();},500);
+    updateOfflineSaveButtons();
     return true;
-  }
-  clearStoredAccessToken();
-  return false;
+  })().catch(error=>{
+    console.error('[Kuro Reader] Cloudflare 연결 실패:',error);
+    if(loginStatus)loginStatus.textContent='서버 연결 실패: '+error.message;
+    if(!silent)alert('Cloudflare 연결 실패\n\n'+error.message);
+    return false;
+  }).finally(()=>{workerConnectPromise=null;});
+  return workerConnectPromise;
 }
 
-function clearStoredAccessToken() {
-  accessToken = "";
-  sessionStorage.removeItem(GOOGLE_ACCESS_TOKEN_KEY);
-  sessionStorage.removeItem(GOOGLE_ACCESS_TOKEN_EXPIRES_KEY);
-  localStorage.removeItem(GOOGLE_ACCESS_TOKEN_KEY);
-  localStorage.removeItem(GOOGLE_ACCESS_TOKEN_EXPIRES_KEY);
-}
+// 구버전 호출부에서 이름을 유지해도 이제 Google 팝업은 호출하지 않습니다.
+async function connectGoogleDrive(){return connectWorkerDrive({silent:false});}
+async function autoReconnectGoogleDrive(){return connectWorkerDrive({silent:true});}
+googleLoginBtn.addEventListener('click',()=>{void connectWorkerDrive({silent:false});});
 
+// Google API를 브라우저가 직접 호출하는 코드는 더 이상 사용하지 않습니다.
+async function apiFetch(){throw new Error('Google Drive 직접 호출은 비활성화됐습니다. Cloudflare API를 사용해 주세요.');}
 
-/* =========================================================
-   GOOGLE 로그인
-========================================================= */
-
-googleLoginBtn.addEventListener(
-  "click",
-  connectGoogleDrive
-);
-
-
-async function connectGoogleDrive() {
-
-  try {
-
-    loginStatus.textContent =
-      "Google 로그인 중...";
-
-    await authorize();
-
-    loginStatus.textContent =
-      "Drive 확인 중...";
-
-    // Drive 상태는 책 목록 조회보다 중요합니다. 두 요청을 병렬로 진행합니다.
-    const [folderId] = await Promise.all([
-      ensureLibraryFolder(),
-      loadState()
-    ]);
-    libraryFolderId = folderId;
-
-    applySettings();
-
-    // 독서 화면 복원을 책 목록 네트워크 응답에 묶지 않습니다.
-    void loadBooks().catch(error => {
-      console.warn('책 목록 갱신 실패', error);
-      if (loginStatus) loginStatus.textContent = 'Drive 폴더 조회 실패: ' + error.message;
-    });
-
-    loginStatus.textContent =
-      "Google Drive 연결됨";
-
-    googleLoginBtn.textContent =
-      "✓ Google Drive 연결됨";
-
-
-    localStorage.setItem(
-      GOOGLE_CONNECTED_KEY,
-      "1"
-    );
-
-
-    if (
-      !isMobileReaderDevice() && !mobileShelfIsOpen && !selectedBook && readerState.lastOpenedBookId
-    ) {
-
-      const book =
-        books.find(
-          b =>
-            b.id ===
-            readerState.lastOpenedBookId
-        ) || readOfflineBookIndex().find(
-          b => b.id === readerState.lastOpenedBookId
-        );
-
-      if (book) {
-
-        await openBook(book);
-
-      }
-
-    }
-
-    // 로그인 직후에는 서버 위치를 우선 표시합니다. 실제 변경이 남아 있으면
-    // 잠시 후 비동기로 업로드하여 휴대폰 시작을 막지 않습니다.
-    if (hasPendingReaderSync()) {
-      setTimeout(() => { void saveState(); }, 7000);
-    }
-    updateOfflineSaveButtons();
-
-  }
-
-  catch (error) {
-
-    console.error(error);
-
-    loginStatus.textContent =
-      "Google 연결 실패";
-
-    alert(
-      "Google Drive 연결 실패\n\n" +
-      error.message
-    );
-
-  }
-
-}
-
-
-async function autoReconnectGoogleDrive() {
-  if (!hasFullDrivePermission()) {
-    showFolderPermissionNotice();
-    return;
-  }
-  try {
-
-    loginStatus.textContent =
-      "Google Drive 자동 연결 중...";
-
-
-    if (!accessToken) {
-
-      await authorizeSilently();
-
-    }
-
-
-    const [folderId] = await Promise.all([ensureLibraryFolder(), loadState()]);
-    libraryFolderId = folderId;
-
-
-    applySettings();
-
-
-    void loadBooks().catch(error => {
-      console.warn('책 목록 갱신 실패', error);
-      if (loginStatus) loginStatus.textContent = 'Drive 폴더 조회 실패: ' + error.message;
-    });
-
-
-    loginStatus.textContent =
-      "Google Drive 연결됨";
-
-    googleLoginBtn.textContent =
-      "✓ Google Drive 연결됨";
-
-
-    if (
-      !isMobileReaderDevice() && !mobileShelfIsOpen && !selectedBook && readerState.lastOpenedBookId
-    ) {
-
-      const book =
-        books.find(
-          b =>
-            b.id ===
-            readerState.lastOpenedBookId
-        ) || readOfflineBookIndex().find(
-          b => b.id === readerState.lastOpenedBookId
-        );
-
-
-      if (book) {
-
-        await openBook(book);
-
-      }
-
-    }
-
-    // 로그인 직후에는 서버 위치를 우선 표시합니다. 실제 변경이 남아 있으면
-    // 잠시 후 비동기로 업로드하여 휴대폰 시작을 막지 않습니다.
-    if (hasPendingReaderSync()) {
-      setTimeout(() => { void saveState(); }, 7000);
-    }
-    updateOfflineSaveButtons();
-
-  }
-
-  catch (error) {
-
-    console.log(
-      "Google Drive 자동 연결 실패",
-      error
-    );
-
-
-    clearStoredAccessToken();
-
-
-    loginStatus.textContent =
-      "Google Drive 연결 필요";
-
-    googleLoginBtn.textContent =
-      "Google Drive 연결";
-
-  }
-
-}
-
-
-function authorizeSilently() {
-  if (!hasFullDrivePermission()) {
-    return Promise.reject(new Error(
-      '기존 Google Drive 폴더를 인식하려면 Drive 연결 버튼으로 권한을 승인해 주세요.'
-    ));
-  }
-  return new Promise(
-    (resolve, reject) => {
-
-      if (!tokenClient) {
-
-        reject(
-          new Error(
-            "Google 인증 준비가 끝나지 않았습니다."
-          )
-        );
-
-        return;
-
-      }
-
-
-      tokenClient.callback =
-        response => {
-
-          if (response.error) {
-
-            reject(
-              new Error(
-                response.error
-              )
-            );
-
-            return;
-
-          }
-
-
-          try {
-            saveAccessTokenResponse(response);
-            resolve(accessToken);
-          } catch (error) {
-            reject(error);
-          }
-
-        };
-
-
-      tokenClient.requestAccessToken({
-
-        prompt: ""
-
-      });
-
-    }
-  );
-
-}
-
-
-function authorize() {
-
-  return new Promise(
-    (resolve, reject) => {
-
-      if (!tokenClient) {
-
-        reject(
-          new Error(
-            "Google 인증 준비가 끝나지 않았습니다."
-          )
-        );
-
-        return;
-
-      }
-
-      tokenClient.callback =
-        response => {
-
-          if (response.error) {
-
-            reject(
-              new Error(
-                response.error
-              )
-            );
-
-            return;
-
-          }
-
-          try {
-            saveAccessTokenResponse(response);
-            resolve(accessToken);
-          } catch (error) {
-            reject(error);
-          }
-
-        };
-
-
-      tokenClient.requestAccessToken({
-        // 드라이브 전체 접근을 처음 요청하는 경우에는 반드시 명시적 동의.
-        prompt: hasFullDrivePermission() ? "" : "consent"
-      });
-
-    }
-  );
-
-}
-
-
-/* =========================================================
-   API 공통
-========================================================= */
-
-async function apiFetch(
-  url,
-  options = {}
-) {
-
-  if (!accessToken) {
-
-    try {
-
-      await authorizeSilently();
-
-    }
-
-    catch (error) {
-
-      clearStoredAccessToken();
-
-      throw new Error(
-        "Google Drive 재연결이 필요합니다."
-      );
-
-    }
-
-  }
-
-
-  let response =
-    await fetch(
-
-      url,
-
-      {
-
-        ...options,
-
-        headers: {
-
-          ...(options.headers || {}),
-
-          Authorization:
-            `Bearer ${accessToken}`
-
-        }
-
-      }
-
-    );
-
-
-  if (
-    response.status === 401
-  ) {
-
-    clearStoredAccessToken();
-
-
-    try {
-
-      await authorizeSilently();
-
-    }
-
-    catch (error) {
-
-      throw new Error(
-        "Google Drive 로그인 시간이 만료되었습니다. 연결 버튼을 다시 눌러주세요."
-      );
-
-    }
-
-
-    response =
-      await fetch(
-
-        url,
-
-        {
-
-          ...options,
-
-          headers: {
-
-            ...(options.headers || {}),
-
-            Authorization:
-              `Bearer ${accessToken}`
-
-          }
-
-        }
-
-      );
-
-  }
-
-
-  if (!response.ok) {
-
-    const text =
-      await response.text();
-
-    throw new Error(
-      text ||
-      `HTTP ${response.status}`
-    );
-
-  }
-
-
-  return response;
-
-}
 
 
 /* =========================================================
@@ -898,100 +366,24 @@ async function apiFetch(
 ========================================================= */
 
 async function ensureLibraryFolder() {
-
-  const query =
-    encodeURIComponent(
-
-      `mimeType='application/vnd.google-apps.folder' and name='${LIBRARY_FOLDER_NAME}' and trashed=false`
-
-    );
-
-
-  const response =
-    await apiFetch(
-
-      "https://www.googleapis.com/drive/v3/files" +
-      `?q=${query}` +
-      "&fields=files(id,name)"
-
-    );
-
-
-  const data =
-    await response.json();
-
-
-  if (
-    data.files &&
-    data.files.length > 0
-  ) {
-
-    return data.files[0].id;
-
-  }
-
-
-  const createResponse =
-    await apiFetch(
-
-      "https://www.googleapis.com/drive/v3/files",
-
-      {
-
-        method: "POST",
-
-        headers: {
-
-          "Content-Type":
-            "application/json"
-
-        },
-
-        body:
-          JSON.stringify({
-
-            name:
-              LIBRARY_FOLDER_NAME,
-
-            mimeType:
-              "application/vnd.google-apps.folder"
-
-          })
-
-      }
-
-    );
-
-
-  const folder =
-    await createResponse.json();
-
-
-  return folder.id;
-
+  if(!accessToken)throw new Error('Cloudflare 서버 연결이 필요합니다.');
+  const info=await readerApi.status();
+  return info.library.id;
 }
-
-
-/* =========================================================
-   책 목록
-========================================================= */
 
 async function driveListChildren(folderId) {
-  const all = [];
-  let pageToken = "";
+  if(!accessToken)throw new Error('Cloudflare 서버 연결이 필요합니다.');
+  const all=[];
+  let pageToken='';
   do {
-    const query = encodeURIComponent(`'${folderId}' in parents and trashed=false`);
-    const url = "https://www.googleapis.com/drive/v3/files?q=" + query +
-      "&fields=" + encodeURIComponent("nextPageToken,files(id,name,mimeType,parents,size,modifiedTime)") +
-      "&pageSize=1000&orderBy=" + encodeURIComponent("folder,name") +
-      (pageToken ? "&pageToken=" + encodeURIComponent(pageToken) : "");
-    const response = await apiFetch(url);
-    const data = await response.json();
-    all.push(...(data.files || []));
-    pageToken = data.nextPageToken || "";
-  } while (pageToken);
+    const result=await readerApi.files(folderId,pageToken);
+    all.push(...(result.files||[]));
+    pageToken=result.nextPageToken||'';
+  } while(pageToken);
   return all;
 }
+
+
 
 async function loadBooks() {
   if (!libraryFolderId) return;
@@ -1066,16 +458,15 @@ async function openLibraryFolder(id, path) {
 }
 
 async function createLibraryFolder() {
-  const name = prompt("새 폴더 이름을 입력하세요.");
-  if (!name || !name.trim()) return;
-  await runLibraryAction(async () => {
-    await apiFetch("https://www.googleapis.com/drive/v3/files", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({name:name.trim(),mimeType:"application/vnd.google-apps.folder",parents:[currentFolderId || libraryFolderId]})
-    });
+  const name=prompt('새 폴더 이름을 입력하세요.');
+  if(!name?.trim())return;
+  await runLibraryAction(async()=>{
+    await readerApi.makeFolder(name.trim(),currentFolderId||libraryFolderId);
     await loadBooks();
   });
 }
+
+
 
 async function driveRename(item) {
   const name = prompt("새 이름을 입력하세요.", item.name);
@@ -1084,9 +475,7 @@ async function driveRename(item) {
     alert("TXT/EPUB 파일 확장자를 유지해 주세요."); return;
   }
   await runLibraryAction(async () => {
-    await apiFetch("https://www.googleapis.com/drive/v3/files/" + encodeURIComponent(item.id), {
-      method:"PATCH", headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name.trim()})
-    });
+    await readerApi.rename(item.id,name.trim());
     if (selectedBook && selectedBook.id === item.id) {
       selectedBook.name = name.trim(); mobileBookTitle.textContent = name.trim();
       if (item.mimeType !== "application/vnd.google-apps.folder") epubTitle.textContent = name.trim();
@@ -1133,9 +522,7 @@ async function driveMove(item, isFolder) {
       if (descendants.some(f => f.id === target.id)) { alert("폴더를 자신의 하위 폴더로 이동할 수 없습니다."); return; }
     }
     const parentId = (item.parents || [currentFolderId])[0];
-    const params = new URLSearchParams({addParents:target.id,fields:"id,name,parents"});
-    if (parentId) params.set("removeParents",parentId);
-    await apiFetch("https://www.googleapis.com/drive/v3/files/" + encodeURIComponent(item.id) + "?" + params.toString(), {method:"PATCH"});
+    await readerApi.move(item.id,target.id);
     await loadBooks();
   });
 }
@@ -1149,7 +536,7 @@ async function driveMoveToTrash(item, isFolder) {
     return;
   }
   if (!navigator.onLine || !accessToken) {
-    alert('Google Drive 연결 상태에서만 휴지통으로 이동할 수 있습니다.');
+    alert('Cloudflare 서버 연결 상태에서만 휴지통으로 이동할 수 있습니다.');
     return;
   }
 
@@ -1160,15 +547,7 @@ async function driveMoveToTrash(item, isFolder) {
 
   await runLibraryAction(async () => {
     const id = item.id;
-    const query = new URLSearchParams({fields: 'id,name,trashed'});
-    await apiFetch(
-      'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(id) + '?' + query.toString(),
-      {
-        method: 'PATCH',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({trashed: true})
-      }
-    );
+    await readerApi.trash(id);
 
     // 현재 읽는 책을 삭제했으면 다음 실행에서 그 책을 다시 열려고 하지 않도록 처리합니다.
     if (!isFolder && readerState.lastOpenedBookId === id) {
@@ -1226,7 +605,7 @@ async function handleFileUpload(event) {
   if (!accessToken) {
 
     alert(
-      "먼저 Google Drive를 연결하세요."
+      "먼저 Cloudflare 서버를 연결하세요."
     );
 
     event.target.value = "";
@@ -1276,112 +655,12 @@ async function handleFileUpload(event) {
 ========================================================= */
 
 async function uploadBook(file) {
-
-  const metadata = {
-
-    name:
-      file.name,
-
-    parents: [
-      currentFolderId || libraryFolderId
-    ]
-
-  };
-
-
-  return multipartUpload(
-    metadata,
-    file
-  );
-
+  if(!accessToken)throw new Error('Cloudflare 서버를 연결해 주세요.');
+  return readerApi.upload(file,currentFolderId||libraryFolderId,(done,total)=>{
+    if(loginStatus)loginStatus.textContent=`${file.name} 업로드 중... ${Math.round(done/total*100)}%`;
+  });
 }
 
-
-async function multipartUpload(
-  metadata,
-  blob,
-  fileId = null
-) {
-
-  const boundary =
-    "reader_" +
-    Math.random()
-      .toString(36)
-      .substring(2);
-
-
-  const body =
-    new Blob(
-
-      [
-
-        `--${boundary}\r\n`,
-
-        "Content-Type: application/json; charset=UTF-8\r\n\r\n",
-
-        JSON.stringify(metadata),
-
-        `\r\n--${boundary}\r\n`,
-
-        `Content-Type: ${blob.type || "application/octet-stream"}\r\n\r\n`,
-
-        blob,
-
-        `\r\n--${boundary}--`
-
-      ],
-
-      {
-
-        type:
-          `multipart/related; boundary=${boundary}`
-
-      }
-
-    );
-
-
-  const url =
-    fileId
-
-      ?
-
-      `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=multipart`
-
-      :
-
-      "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
-
-
-  const response =
-    await apiFetch(
-
-      url,
-
-      {
-
-        method:
-          fileId
-            ? "PATCH"
-            : "POST",
-
-        headers: {
-
-          "Content-Type":
-            `multipart/related; boundary=${boundary}`
-
-        },
-
-        body
-
-      }
-
-    );
-
-
-  return response.json();
-
-}
 
 
 /* =========================================================
@@ -1392,7 +671,8 @@ async function openBook(book) {
   // Read the Android slot for this book before opening it.  No sync is
   // required when offline: keep the website's own stored location.
   if (navigator.onLine && accessToken) {
-    await refreshAppProgressFromDrive({force:true});
+    try { await refreshAppProgressFromDrive({force:true,bookId:book.id}); }
+    catch(error){console.warn('읽던 위치 확인 실패 · 로컬 위치 사용',error);}
   }
 
   // 사이드바나 오프라인 목록에서 직접 연 책도 Android 뒤로가기를 보장합니다.
@@ -1499,7 +779,7 @@ async function downloadDriveFile(fileId) {
   if (!navigator.onLine) {
     throw new Error("이 책은 아직 오프라인 저장되지 않았습니다. 인터넷에 연결해 저장해 주세요.");
   }
-  return apiFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`);
+  return readerApi.download(fileId);
 }
 
 
@@ -2804,105 +2084,128 @@ async function applyLatestCloudPositionToOpenBook(previous, bookId) {
   updateOfflineSyncStatus('다른 기기에서 읽던 위치를 불러왔습니다.');
 }
 
-async function refreshReaderStateFromDrive({applyToOpenedBook = true} = {}) {
-  if (!navigator.onLine || !accessToken) return false;
-  if (readerStateRefreshInFlight) return readerStateRefreshInFlight;
-
-  readerStateRefreshInFlight = (async () => {
-    const activeId = selectedBook?.id || null;
-    const wasTxt = !!selectedBook?.name?.toLowerCase().endsWith('.txt');
-    const previous = activeId ? structuredClone(
-      wasTxt ? readerState.txtProgress?.[activeId] || null :
-        readerState.epubProgress?.[activeId] || null) : null;
-    const startMutation = readerProgressMutationCounter;
+async function refreshReaderStateFromDrive({applyToOpenedBook=true,bookId=null}={}) {
+  if(!navigator.onLine || !accessToken)return false;
+  const id=bookId||selectedBook?.id||readerState.lastOpenedBookId;
+  if(!id){cloudReaderStateReady=true;return true;}
+  if(readerStateRefreshInFlight && readerStateRefreshInFlight.id===id)
+    return readerStateRefreshInFlight.promise;
+  const promise=(async()=>{
+    const activeId=selectedBook?.id||null;
+    const wasTxt=!!selectedBook?.name?.toLowerCase().endsWith('.txt');
+    const previous=(activeId===id)
+      ? structuredClone(wasTxt?readerState.txtProgress[id]||null:readerState.epubProgress[id]||null)
+      : null;
+    const startMutation=readerProgressMutationCounter;
     try {
-      if (!stateFileId) {
-        const query = encodeURIComponent(
-          `name='${STATE_FILE_NAME}' and trashed=false`);
-        const response = await apiFetch(
-          'https://www.googleapis.com/drive/v3/files' +
-          '?spaces=appDataFolder' + `&q=${query}` + '&fields=files(id,name)');
-        const found = await response.json();
-        stateFileId = found.files?.[0]?.id || '';
+      const result=await readerApi.getProgress(id);
+      const app=result.app||null, web=result.web||null;
+      if(app){
+        if(app.cfi||app.format==='epub')appReadingProgressSnapshot.epubProgress[id]=app;
+        else appReadingProgressSnapshot.txtProgress[id]=app;
+      }else{
+        delete appReadingProgressSnapshot.txtProgress[id];
+        delete appReadingProgressSnapshot.epubProgress[id];
       }
-      let remote = {};
-      if (stateFileId) {
-        const response = await apiFetch(
-          `https://www.googleapis.com/drive/v3/files/${stateFileId}?alt=media`);
-        remote = JSON.parse(await response.text());
+      lastFetchedDriveReadingState ||= normalizeReaderCloudState({});
+      delete lastFetchedDriveReadingState.txtProgress[id];
+      delete lastFetchedDriveReadingState.epubProgress[id];
+      if(web){
+        const isEpub=!!web.cfi||web.format==='epub';
+        const type=isEpub?'epubProgress':'txtProgress';
+        lastFetchedDriveReadingState[type][id]=structuredClone(web);
+        const local=readerState[type][id]||null;
+        const pending=hasPendingProgressForBook(id);
+        // TXT는 장/문자 위치가 더 뒤인 값을 우선하며,
+        // 아직 업로드하지 않은 진도는 절대 잃지 않습니다.
+        if(!local)readerState[type][id]=structuredClone(web);
+        else if(isEpub){
+          const cmp=compareEpubProgressCFI(local,web);
+          if(cmp===null){
+            if(!pending && Number(web.userUpdatedAt||web.updatedAt||0)>=Number(local.userUpdatedAt||local.updatedAt||0))
+              readerState[type][id]=structuredClone(web);
+          } else if(cmp<0 && !pending)readerState[type][id]=structuredClone(web);
+        } else {
+          const later=furthestTxtProgress(local,web);
+          if(later===web && !pending)readerState[type][id]=structuredClone(web);
+        }
       }
-      // 병합 전 원본 서버 위치를 보존해 진단/표시에 사용합니다.
-      lastFetchedDriveReadingState = normalizeReaderCloudState(remote);
-      readerState = normalizeReaderCloudState(remote);
-      cloudReaderStateReady = true;
-      applyPendingReaderState();
-      lastReaderCloudCheckAt = Date.now();
-      // 사용자가 네트워크 요청 중 페이지를 넘겼다면 화면을 자동 이동하지 않습니다.
-      if (applyToOpenedBook && activeId && selectedBook?.id === activeId &&
-          startMutation === readerProgressMutationCounter &&
-          !document.hidden && !mobilePageState.pageTurning &&
-          !mobilePageState.activeDrag) {
-        await applyLatestCloudPositionToOpenBook(previous, activeId);
+      cloudReaderStateReady=true;
+      lastAppProgressReadAt=Date.now();
+      lastReaderCloudCheckAt=Date.now();
+      if(applyToOpenedBook && activeId===id && selectedBook?.id===id &&
+          startMutation===readerProgressMutationCounter && !document.hidden &&
+          !mobilePageState.pageTurning && !mobilePageState.activeDrag){
+        await applyLatestCloudPositionToOpenBook(previous,id);
       }
       return true;
-    } catch (error) {
-      console.warn('다른 기기 읽던 위치 확인 실패', error);
-      if (!cloudReaderStateReady) restoreLocalReaderState();
+    }catch(error){
+      console.warn('D1 읽던 위치 불러오기 실패',error);
       return false;
     }
   })();
-  try { return await readerStateRefreshInFlight; }
-  finally { readerStateRefreshInFlight = null; }
+  readerStateRefreshInFlight={id,promise};
+  try{return await promise;}
+  finally{if(readerStateRefreshInFlight?.promise===promise)readerStateRefreshInFlight=null;}
 }
 
-async function loadState() {
-  await refreshReaderStateFromDrive();
+async function loadState(){
+  cloudReaderStateReady=true;
+  return refreshReaderStateFromDrive({applyToOpenedBook:false});
 }
-
 
 /* =========================================================
-   appData 상태 저장
+   v28: 사이트 슬롯만 D1에 기록합니다. 설정은 각 브라우저에 로컬 저장.
+   이전 버전 오프라인 pending 책 ID는 전송 완료 때까지 유지합니다.
 ========================================================= */
-
-let readerStateUploadInFlight = null;
-async function saveState() {
-  // 인터넷이 끊겨도 위치는 이미 기기에 기록되어 있습니다.
-  if (!navigator.onLine || !accessToken || !cloudReaderStateReady ||
-      !hasPendingReaderSync()) return false;
-  if (readerStateUploadInFlight) return readerStateUploadInFlight;
-
-  readerStateUploadInFlight = (async () => {
-    // 최신 Drive 데이터를 병합한 뒤 현재 기기에서 실제 변경한 책만 우선 적용합니다.
-    const refreshed = await refreshReaderStateFromDrive({applyToOpenedBook: false});
-    if (!refreshed || !hasPendingReaderSync()) return false;
-    const pendingVersion = getPendingReaderSync()?.version;
-    const snapshot = JSON.parse(JSON.stringify(readerState));
-    try {
-      const blob = new Blob([JSON.stringify(snapshot, null, 2)],
-        {type: "application/json"});
-      const metadata = stateFileId
-        ? {name: STATE_FILE_NAME}
-        : {name: STATE_FILE_NAME, parents: ["appDataFolder"]};
-      const result = await multipartUpload(metadata, blob, stateFileId || null);
-      if (!stateFileId) stateFileId = result.id;
-      // 업로드 도중 사용자가 더 읽은 경우에는 새 위치를 지우지 않습니다.
-      if (getPendingReaderSync()?.version === pendingVersion) {
+let readerStateUploadInFlight=null;
+async function saveState(){
+  if(!navigator.onLine || !accessToken || !cloudReaderStateReady || !hasPendingReaderSync())
+    return false;
+  if(readerStateUploadInFlight)return readerStateUploadInFlight;
+  readerStateUploadInFlight=(async()=>{
+    const pending=getPendingReaderSync();
+    if(!pending)return false;
+    const version=pending.version;
+    const ids=Object.keys(pending.bookIds||{});
+    try{
+      for(const id of ids){
+        const txt=readerState.txtProgress[id];
+        const epub=readerState.epubProgress[id];
+        const position=txt||epub;
+        if(!position)continue;
+        const remote=await readerApi.getProgress(id);
+        if(txt && remote.web && !remote.web.cfi &&
+            compareFurthestTxtProgress(remote.web,txt)>0){
+          // 이전 기기의 더 앞선 진도를 덮어쓰지 않습니다.
+          readerState.txtProgress[id]=structuredClone(remote.web);
+        }else if(epub && remote.web?.cfi){
+          const c=compareEpubProgressCFI(epub,remote.web);
+          if(c!==null && c<0)readerState.epubProgress[id]=structuredClone(remote.web);
+          else await readerApi.saveProgress(id,'web',{...epub,format:'epub'});
+        }else{
+          await readerApi.saveProgress(id,'web',{...position,format:epub?'epub':'txt'});
+        }
+      }
+      const fresh=getPendingReaderSync();
+      if(fresh?.version===version){
         localStorage.removeItem(OFFLINE_PENDING_STATE_KEY);
-        updateOfflineSyncStatus("Google Drive에 읽던 위치 저장됨");
+        updateOfflineSyncStatus('Cloudflare에 읽던 위치 저장됨');
+      }else{
+        setTimeout(()=>{void saveState();},400);
       }
-      else {
-        setTimeout(() => { void saveState(); }, 300);
-      }
+      localStorage.setItem(OFFLINE_LOCAL_STATE_KEY,JSON.stringify(readerState));
       return true;
-    } catch (error) {
-      console.warn("읽던 위치 온라인 동기화 대기", error);
-      updateOfflineSyncStatus("읽던 위치 기기에 저장됨 · 재연결 후 동기화");
+    }catch(error){
+      console.warn('읽던 위치 업로드 대기',error);
+      updateOfflineSyncStatus('읽던 위치 기기에 저장됨 · 서버 재연결 후 동기화');
       return false;
     }
   })();
-  try { return await readerStateUploadInFlight; }
-  finally { readerStateUploadInFlight = null; }
+  try{return await readerStateUploadInFlight;}
+  finally{readerStateUploadInFlight=null;}
 }
+
 
 
 /* =========================================================
@@ -4631,7 +3934,7 @@ async function ensureMobileEpubLocations(book) {
 }
 
 initializeMobilePagedReading();
-document.documentElement.dataset.readerBuild = 'v16-cloud-priority';
+document.documentElement.dataset.readerBuild = 'v28-worker-d1';
 
 /* =========================================================
    PWA 설치 및 폴더 관리 스타일
@@ -4657,12 +3960,12 @@ document.documentElement.dataset.readerBuild = 'v16-cloud-priority';
   document.head.appendChild(style);
   if ("serviceWorker" in navigator && location.protocol === "https:") {
     window.addEventListener("load", () => {
-      navigator.serviceWorker.register("./sw.js?v=24").then(reg => {
+      navigator.serviceWorker.register("./sw.js?v=28").then(reg => {
         reg.update().catch(() => {});
         // 강제로 캐시를 삭제하지 않고 새 서비스 워커 활성화 후 한 번만 다시 읽습니다.
         navigator.serviceWorker.addEventListener('controllerchange', () => {
-          if (sessionStorage.getItem('reader-v24-theme-bars-updated') !== '1') {
-            sessionStorage.setItem('reader-v24-theme-bars-updated','1');
+          if (sessionStorage.getItem('reader-v28-cloudflare-update-done') !== '1') {
+            sessionStorage.setItem('reader-v28-cloudflare-update-done','1');
             location.reload();
           }
         });
@@ -5158,8 +4461,7 @@ async function saveCurrentBookOffline() {
 
   try {
     // 기존 캐시가 있더라도 '저장'을 누르면 Drive에서 최신 원본으로 갱신합니다.
-    const response = await apiFetch(
-      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(originalBookId)}?alt=media`);
+    const response = await readerApi.download(originalBookId);
     const blob = await response.blob();
     if (originalBookName.toLowerCase().endsWith('.epub')) {
       // EPUB 파일을 읽는 라이브러리도 미리 보관해야 진짜 오프라인 읽기가 됩니다.
@@ -5464,31 +4766,19 @@ function applyReaderBrightness() {
   );
 }
 
-async function tryResumeOfflineReaderSync({refreshBooks=true} = {}) {
-  if (!navigator.onLine || document.hidden) return;
-  if (window.google?.accounts?.oauth2 && !tokenClient) initGoogle();
-  if (!tokenClient) {
-    // 오프라인 시작 때 원격 Google 스크립트가 로드되지 않았을 수 있습니다.
-    if (!document.getElementById('readerGisReconnectScript')) {
-      const script = document.createElement('script');
-      script.id = 'readerGisReconnectScript';
-      script.src = 'https://accounts.google.com/gsi/client';
-      script.async = true;
-      script.onload = waitForGoogle;
-      document.head.appendChild(script);
-    }
+async function tryResumeOfflineReaderSync({refreshBooks=true}={}) {
+  if(!navigator.onLine || document.hidden)return;
+  if(!readerApi.token){accessToken='';return;}
+  if(!accessToken || !cloudReaderStateReady){
+    await connectWorkerDrive({silent:true});
     return;
   }
-  if (cloudReaderStateReady && accessToken) {
-    await refreshReaderStateFromDrive();
-    if (hasPendingReaderSync()) await saveState();
-    if (refreshBooks && libraryFolderId) await loadBooks();
-    return;
-  }
-  if (localStorage.getItem(GOOGLE_CONNECTED_KEY) === '1') {
-    await autoReconnectGoogleDrive();
-  }
+  await refreshReaderStateFromDrive();
+  if(hasPendingReaderSync())await saveState();
+  if(refreshBooks && libraryFolderId)await loadBooks();
 }
+
+
 // 앱으로 복귀했을 때, 로컬에 변경사항이 없어도 PC의 최신 위치를 가져옵니다.
 // 갱신 간격을 제한하여 잦은 탭 전환/화면 잠금 해제 시 호출을 합칩니다.
 window.addEventListener('focus', () => {
@@ -5535,11 +4825,11 @@ function initializeManualReaderSyncButton() {
       return;
     }
     if (!accessToken) {
-      alert('Google Drive 연결 후 다시 눌러 주세요.');
+      alert('Cloudflare 서버 연결 후 다시 눌러 주세요.');
       return;
     }
     button.disabled = true;
-    button.textContent = 'Drive 읽던 위치 확인 중...';
+    button.textContent = '서버 읽던 위치 확인 중...';
     try {
       const ok = await refreshReaderStateFromDrive();
       if (ok) {
@@ -5557,10 +4847,10 @@ function initializeManualReaderSyncButton() {
             `${(Number(position.chapterIndex) || 0) + 1}번째 장`;
           return position.cfi ? 'EPUB 위치 있음' : '기록 없음';
         };
-        alert('Drive 저장 위치: ' + titleFor(cloud) + '\n' +
+        alert('서버 저장 위치: ' + titleFor(cloud) + '\n' +
           '현재 기기 위치: ' + titleFor(local) + '\n\n' +
-          'Drive 위치가 더 최신이라면 반영됩니다.');
-      } else alert('Google Drive 위치를 불러오지 못했습니다. 다시 시도해 주세요.');
+          '서버 위치가 더 뒤라면 반영됩니다.');
+      } else alert('서버 위치를 불러오지 못했습니다. 다시 시도해 주세요.');
     } finally {
       button.textContent = '⟳ 다른 기기 읽던 위치 불러오기';
       button.disabled = false;
@@ -5572,11 +4862,11 @@ function initializeManualReaderSyncButton() {
   const forceButton = document.createElement('button');
   forceButton.type = 'button';
   forceButton.id = 'readerForceCloudBtn';
-  forceButton.textContent = '☁ 현재 책을 Drive에 저장된 위치로 이동';
+  forceButton.textContent = '☁ 현재 책을 서버에 저장된 위치로 이동';
   forceButton.style.cssText = button.style.cssText;
   forceButton.addEventListener('click', async () => {
     if (!selectedBook || !navigator.onLine || !accessToken) {
-      alert('현재 책을 연 상태에서 Google Drive를 연결해 주세요.'); return;
+      alert('현재 책을 연 상태에서 Cloudflare 서버를 연결해 주세요.'); return;
     }
     forceButton.disabled = true;
     const id = selectedBook.id;
@@ -5587,7 +4877,7 @@ function initializeManualReaderSyncButton() {
       const position = structuredClone(isTxt
         ? lastFetchedDriveReadingState?.txtProgress?.[id]
         : lastFetchedDriveReadingState?.epubProgress?.[id]);
-      if (!position) { alert('Drive에 이 책의 읽던 위치가 없습니다. PC에서 먼저 저장해 주세요.'); return; }
+      if (!position) { alert('서버에 이 책의 읽던 위치가 없습니다. PC에서 먼저 저장해 주세요.'); return; }
       const pending = getPendingReaderSync();
       if (pending?.bookIds) {
         delete pending.bookIds[id];
@@ -5608,7 +4898,7 @@ function initializeManualReaderSyncButton() {
       await applyLatestCloudPositionToOpenBook(previous, id);
       const txtTitle = isTxt ? (txtChapters?.[position.chapterIndex]?.title ||
         `${(Number(position.chapterIndex)||0)+1}번째 장`) : 'EPUB 위치';
-      alert('Drive 위치로 이동했습니다: ' + txtTitle);
+      alert('서버 위치로 이동했습니다: ' + txtTitle);
     } catch (error) { console.error(error); alert('동기화 오류: ' + error.message); }
     finally { forceButton.disabled = false; }
   });
@@ -5619,12 +4909,12 @@ function initializeManualReaderSyncButton() {
   const uploadButton = document.createElement('button');
   uploadButton.id = 'readerSyncUploadBtn';
   uploadButton.type = 'button';
-  uploadButton.textContent = '☁ 지금 읽던 위치 Google Drive에 저장';
+  uploadButton.textContent = '☁ 지금 읽던 위치 Cloudflare에 저장';
   uploadButton.style.cssText = button.style.cssText;
   uploadButton.addEventListener('click', async () => {
     if (!selectedBook) { alert('먼저 책을 열어주세요.'); return; }
     if (!navigator.onLine || !accessToken) {
-      alert('인터넷과 Google Drive 연결이 필요합니다.'); return;
+      alert('인터넷과 Cloudflare 서버 연결이 필요합니다.'); return;
     }
     const id = selectedBook.id;
     const isTxt = selectedBook.name.toLowerCase().endsWith('.txt');
@@ -5651,17 +4941,35 @@ function initializeManualReaderSyncButton() {
     localStorage.setItem(OFFLINE_LOCAL_STATE_KEY, JSON.stringify(readerState));
     readerProgressMutationCounter++;
     uploadButton.disabled = true;
-    uploadButton.textContent = 'Drive에 저장 중...';
+    uploadButton.textContent = 'Cloudflare에 저장 중...';
     try {
       const saved = await saveState();
-      alert(saved ? '현재 책 읽던 위치를 Google Drive에 저장했습니다.' :
-        '지금은 Drive에 저장하지 못했습니다. Google 연결을 확인한 뒤 다시 시도해 주세요.');
+      alert(saved ? '현재 책 읽던 위치를 Cloudflare에 저장했습니다.' :
+        '지금은 서버에 저장하지 못했습니다. Google 연결을 확인한 뒤 다시 시도해 주세요.');
     } finally {
       uploadButton.disabled = false;
-      uploadButton.textContent = '☁ 지금 읽던 위치 Google Drive에 저장';
+      uploadButton.textContent = '☁ 지금 읽던 위치 Cloudflare에 저장';
     }
   });
   settingsPanel.appendChild(uploadButton);
+
+  const importBtn=document.createElement('button');
+  importBtn.id='readerImportOldProgressBtn';
+  importBtn.type='button';
+  importBtn.textContent='↳ 이전 Google Drive 읽던 위치 D1으로 가져오기 (최초 1회)';
+  importBtn.style.cssText=button.style.cssText;
+  importBtn.addEventListener('click',async()=>{
+    if(!accessToken){alert('먼저 Cloudflare 서버를 연결해 주세요.');return;}
+    if(!confirm('기존 reader-state.json 및 reader-app-progress.json의 기록을 D1에 복사할까요?\n\n이미 D1에 있는 기록은 덮어쓰지 않습니다.'))return;
+    importBtn.disabled=true;
+    try {
+      const result=await readerApi.call('/api/admin/import-progress',{method:'POST'});
+      alert('기존 읽던 위치 가져오기 결과\n'+JSON.stringify(result.imported||{},null,2));
+      await refreshReaderStateFromDrive();
+    }catch(error){alert('이전 기록 가져오기 실패: '+error.message+'\n기존 데이터는 삭제되지 않았습니다.');}
+    finally{importBtn.disabled=false;}
+  });
+  settingsPanel.appendChild(importBtn);
 }
 window.addEventListener('load', () => initializeManualReaderSyncButton());
 window.addEventListener('load', () => initializeReaderBrightness());
@@ -6023,7 +5331,7 @@ function renderMobileBookshelf() {
     const message = !navigator.onLine
       ? '현재 폴더에서 오프라인 저장한 책을 찾지 못했습니다.\n인터넷 연결 상태에서 책을 저장하면 여기서 읽을 수 있어요.'
       : !accessToken && !readMobileShelfFolderCache(currentFolderId)
-        ? 'Google Drive를 연결하면 폴더와 책 목록이 나타납니다.\n오른쪽 위 ⋮ 메뉴에서 연결해 주세요.'
+        ? 'Cloudflare 서버를 연결하면 폴더와 책 목록이 나타납니다.\n오른쪽 위 ⋮ 메뉴에서 연결해 주세요.'
         : '이 폴더에는 표시할 책이 없습니다.';
     const blank=shelfMakeNode('div','shelf-empty',message);
     blank.style.whiteSpace='pre-line';list.appendChild(blank);
@@ -6113,7 +5421,7 @@ function registerMobileReadingBackEntry() {
 
 async function openMobileShelfBook(book) {
   if (!hasOfflineBook(book.id) && (!navigator.onLine || !accessToken)) {
-    alert('이 책은 기기에 저장되어 있지 않습니다. 인터넷 연결과 Google Drive 연결이 필요합니다.');
+    alert('이 책은 기기에 저장되어 있지 않습니다. 인터넷 연결과 Cloudflare 서버 연결이 필요합니다.');
     return;
   }
 
@@ -6176,7 +5484,7 @@ function showMobileShelfFileMenu(item,isFolder) {
 
 async function showMobileShelfMoveTargets(item,isFolder) {
   if (!navigator.onLine || !accessToken) {
-    alert('파일 이동은 Google Drive 연결이 필요합니다.');return;
+    alert('파일 이동은 Cloudflare 서버 연결이 필요합니다.');return;
   }
   // Explicit move action only: scanning nested destinations at app startup
   // would slow the reader down.
@@ -6191,9 +5499,7 @@ async function showMobileShelfMoveTargets(item,isFolder) {
       action: async()=>{
         const parentId=(item.parents || [currentFolderId])[0];
         if(dest.id===parentId)return;
-        const p=new URLSearchParams({addParents:dest.id,fields:'id,name,parents'});
-        if(parentId)p.set('removeParents',parentId);
-        await apiFetch('https://www.googleapis.com/drive/v3/files/'+encodeURIComponent(item.id)+'?'+p,{method:'PATCH'});
+        await readerApi.move(item.id,dest.id);
         await loadBooks();
         alert('선택한 폴더로 이동했습니다.');
       }
@@ -6205,10 +5511,10 @@ function showMobileShelfMainMenu() {
     {label:'📁 현재 위치에 새 폴더 만들기',action:()=>createLibraryFolder()},
     {label:'↑ 현재 위치에 TXT/EPUB 업로드',action:()=>fileInput.click()},
     {label:'⟳ 이 폴더 새로고침',action:async()=>{
-      if(!accessToken){alert('Google Drive를 연결해 주세요.');return;}
+      if(!accessToken){alert('Cloudflare 서버를 연결해 주세요.');return;}
       await loadBooks();
     }},
-    {label:hasFullDrivePermission()?'☁ Google Drive 연결':'☁ 기존 Drive 폴더 접근 권한 승인',action:()=>connectGoogleDrive()},
+    {label:readerApi.token?'☁ Cloudflare 서버 연결 확인':'☁ Cloudflare 서버 연결',action:()=>connectWorkerDrive({silent:false})},
     {label:'⚙ 읽기 설정',action:()=>openSettings()}
   ]);
 }

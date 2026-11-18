@@ -1,18 +1,15 @@
-/* v10: PWA 앱 화면과 EPUB 엔진을 오프라인에서 실행하도록 보관합니다. */
-const CACHE_NAME = 'drive-novel-reader-v26-txt-encoding-20261117';
+/* Kuro Reader Cloudflare Worker v28: HTML, CSS, JS, EPUB engine offline cache. */
+const CACHE_NAME = 'drive-novel-reader-v28-worker-d1-20261118';
 const EPUB_RUNTIME_URL = 'https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js';
 const APP_SHELL = [
-  './', './index.html', './style.css', './app.js',
+  './', './index.html', './style.css', './worker_client.js', './app.js',
   './manifest.webmanifest', './manifest-android.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png'
 ];
-
 self.addEventListener('install', event => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE_NAME);
     await cache.addAll(APP_SHELL);
-    // 사이트가 기존에 CDN에서 EPUB 라이브러리를 사용하기 때문에 함께 저장합니다.
-    // 일시적인 CDN 오류만으로 앱 설치까지 실패시키지는 않습니다.
     try { await cache.add(EPUB_RUNTIME_URL); }
     catch (error) { console.warn('EPUB 오프라인 엔진 캐싱 대기', error); }
     await self.skipWaiting();
@@ -27,7 +24,6 @@ self.addEventListener('activate', event => {
     await self.clients.claim();
   })());
 });
-
 self.addEventListener('fetch', event => {
   const request = event.request;
   if (request.method !== 'GET') return;
@@ -50,7 +46,6 @@ self.addEventListener('fetch', event => {
   const isShell = request.mode === 'navigate' || shellPaths.includes(url.pathname);
   event.respondWith((async () => {
     if (isShell) {
-      // 앱 실행 경로와 JS/CSS는 캐시 우선. 새 버전은 SW install 때 캐시가 교체됩니다.
       const cached = await caches.match(request, {ignoreSearch:true}) ||
         (request.mode === 'navigate' ? await caches.match('./index.html') : null);
       if (cached) return cached;
