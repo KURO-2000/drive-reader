@@ -1,5 +1,5 @@
 /* Kuro Reader Cloudflare Worker v28: HTML, CSS, JS, EPUB engine offline cache. */
-const CACHE_NAME = 'drive-novel-reader-v28-worker-d1-20261118';
+const CACHE_NAME = 'drive-novel-reader-v36-web-preferences-20261120';
 const EPUB_RUNTIME_URL = 'https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js';
 const APP_SHELL = [
   './', './index.html', './style.css', './worker_client.js', './app.js',
@@ -45,9 +45,12 @@ self.addEventListener('fetch', event => {
   const shellPaths = APP_SHELL.map(file => new URL(file, self.registration.scope).pathname);
   const isShell = request.mode === 'navigate' || shellPaths.includes(url.pathname);
   event.respondWith((async () => {
-    if (isShell) {
-      const cached = await caches.match(request, {ignoreSearch:true}) ||
-        (request.mode === 'navigate' ? await caches.match('./index.html') : null);
+    // Application code is network-first. This prevents old PWA caches from
+    // serving last week's settings logic to a freshly opened private window.
+    const networkFirst = isShell && (request.mode === 'navigate' ||
+      /\.(?:js|html)$/i.test(url.pathname));
+    if (isShell && !networkFirst) {
+      const cached = await caches.match(request, {ignoreSearch:true});
       if (cached) return cached;
     }
     try {

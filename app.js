@@ -1676,6 +1676,7 @@ themeSelect.addEventListener(
 
     applySettings();
 
+    markWebSettingsChanged();
     scheduleStateSave();
 
   }
@@ -1693,6 +1694,7 @@ fontSizeRange.addEventListener(
 
     applySettings();
 
+    markWebSettingsChanged();
     scheduleStateSave();
 
   }
@@ -1710,6 +1712,7 @@ lineHeightRange.addEventListener(
 
     applySettings();
 
+    markWebSettingsChanged();
     scheduleStateSave();
 
   }
@@ -1726,11 +1729,44 @@ contentWidthRange.addEventListener(
 
     applySettings();
 
+    markWebSettingsChanged();
     scheduleStateSave();
 
   }
 );
 
+
+// v36: User preference edits must be tracked even if there was no previous
+// localStorage record (fresh incognito/private browsing session). Do not depend
+// on comparing with the previous local snapshot: it may not exist at all.
+function markWebSettingsChanged() {
+  const current=getPendingReaderSync();
+  const pending=(current && current.schemaVersion===4) ? current : {
+    schemaVersion:4, bookIds:{}, explicitBookIds:{},
+    settingsChanged:false, lastOpenedChanged:false
+  };
+  pending.bookIds ||= {};
+  pending.explicitBookIds ||= {};
+  pending.settingsChanged=true;
+  pending.version=Date.now()+Math.random();
+  pending.settings=structuredClone(readerState.settings);
+  pending.lastOpenedBookId=readerState.lastOpenedBookId;
+  pending.state=structuredClone(readerState);
+  try {
+    localStorage.setItem(OFFLINE_LOCAL_STATE_KEY,JSON.stringify(readerState));
+    localStorage.setItem(OFFLINE_PENDING_STATE_KEY,JSON.stringify(pending));
+  } catch (error) {
+    console.warn('읽기 설정 임시 저장 실패 · 서버 저장은 재시도합니다',error);
+  }
+  // Keep pending edits authoritative until the server has acknowledged them.
+  webSettingsFetchedAt=0;
+}
+
+// v35: Commit settings as soon as the user finishes an adjustment.
+// This is separate from the slower per-page reading-progress debounce.
+for (const element of [themeSelect,fontSizeRange,lineHeightRange,contentWidthRange]) {
+  element.addEventListener('change',()=>{void saveState();});
+}
 
 // 앱 본문, 상단 상태 표시줄 및 페이지 바깥쪽 배경색을 같은 색으로 동기화합니다.
 // Android 하단 시스템 내비게이션 바의 실제 색은 OS/브라우저가 결정할 수 있습니다.
@@ -2149,14 +2185,79 @@ async function refreshReaderStateFromDrive({applyToOpenedBook=true,bookId=null}=
   finally{if(readerStateRefreshInFlight?.promise===promise)readerStateRefreshInFlight=null;}
 }
 
+
+// v35: one website-wide settings snapshot in D1 (not per browser/incognito).
+// An intentionally changed offline setting wins only if its local timestamp
+// is later than the server record. Reading-progress pending items are untouched.
+let webSettingsFetchedAt=0;
+let webSettingsPullInFlight=null;
+async function syncWebSettingsFromCloud({force=false}={}) {
+  if (!navigator.onLine || !readerApi.token) return false;
+  if (!force && Date.now()-webSettingsFetchedAt<15000) return true;
+  if (webSettingsPullInFlight) return webSettingsPullInFlight;
+  const operation=(async()=>{
+    const remote=await readerApi.getSettings('web');
+    const pending=getPendingReaderSync();
+    const hasPendingPrefs=!!(pending?.settingsChanged || pending?.lastOpenedChanged);
+    const localIsNewer=hasPendingPrefs &&
+      Number(pending.version||0)>Number(remote.updatedAt||0);
+    if (remote.settings && !localIsNewer) {
+      readerState.settings={...readerState.settings,...remote.settings};
+      readerState.lastOpenedBookId=remote.lastOpenedBookId||null;
+      // Old local (including pre-v35) preferences must not later reset D1.
+      if (hasPendingPrefs) {
+        pending.settingsChanged=false;
+        pending.lastOpenedChanged=false;
+        pending.settings=readerState.settings;
+        pending.lastOpenedBookId=readerState.lastOpenedBookId;
+        if (pending.state) {
+          pending.state.settings=structuredClone(readerState.settings);
+          pending.state.lastOpenedBookId=readerState.lastOpenedBookId;
+        }
+        if (Object.keys(pending.bookIds||{}).length)
+          localStorage.setItem(OFFLINE_PENDING_STATE_KEY,JSON.stringify(pending));
+        else localStorage.removeItem(OFFLINE_PENDING_STATE_KEY);
+      }
+      localStorage.setItem(OFFLINE_LOCAL_STATE_KEY,JSON.stringify(readerState));
+    } else if (!remote.settings || localIsNewer) {
+      // First migration uploads existing customized local settings. A brand
+      // new incognito window with defaults must NOT seed the server before
+      // the user's original non-incognito browser has a chance to migrate.
+      const defaults={theme:'sepia',fontSize:20,lineHeight:1.9,
+        contentWidth:850,brightness:100};
+      const hasCustomSettings=Object.keys(defaults).some(key=>
+        readerState.settings[key]!==defaults[key]);
+      if (localIsNewer || hasCustomSettings || readerState.lastOpenedBookId || hasPendingPrefs) {
+        await readerApi.saveSettings('web',readerState.settings,readerState.lastOpenedBookId);
+        if (hasPendingPrefs) {
+          pending.settingsChanged=false;
+          pending.lastOpenedChanged=false;
+          if (Object.keys(pending.bookIds||{}).length)
+            localStorage.setItem(OFFLINE_PENDING_STATE_KEY,JSON.stringify(pending));
+          else localStorage.removeItem(OFFLINE_PENDING_STATE_KEY);
+        }
+      }
+      localStorage.setItem(OFFLINE_LOCAL_STATE_KEY,JSON.stringify(readerState));
+    }
+    webSettingsFetchedAt=Date.now();
+    applySettings();
+    return true;
+  })();
+  webSettingsPullInFlight=operation;
+  try {return await operation;}
+  finally {if(webSettingsPullInFlight===operation)webSettingsPullInFlight=null;}
+}
+
 async function loadState(){
   cloudReaderStateReady=true;
+  try {await syncWebSettingsFromCloud({force:true});}
+  catch(error){console.warn('웹 설정 D1 복원 실패 · 로컬 설정 유지:',error);}
   return refreshReaderStateFromDrive({applyToOpenedBook:false});
 }
 
 /* =========================================================
-   v28: 사이트 슬롯만 D1에 기록합니다. 설정은 각 브라우저에 로컬 저장.
-   이전 버전 오프라인 pending 책 ID는 전송 완료 때까지 유지합니다.
+   v35: reading positions -> D1 web/app slots; reader settings -> D1 web slot.
+   Browsers use a local copy only for offline fallback.
 ========================================================= */
 let readerStateUploadInFlight=null;
 async function saveState(){
@@ -2186,6 +2287,10 @@ async function saveState(){
         }else{
           await readerApi.saveProgress(id,'web',{...position,format:epub?'epub':'txt'});
         }
+      }
+      if (pending.settingsChanged || pending.lastOpenedChanged) {
+        await readerApi.saveSettings('web',readerState.settings,readerState.lastOpenedBookId);
+        webSettingsFetchedAt=Date.now();
       }
       const fresh=getPendingReaderSync();
       if(fresh?.version===version){
@@ -2235,6 +2340,14 @@ function openSettings() {
   settingsPanel.classList.remove(
     "hidden"
   );
+  // A second browser, including an incognito session, might have changed the
+  // shared web settings while this page was idle. Keep pending local edits.
+  const pending=getPendingReaderSync();
+  if (readerApi.token && navigator.onLine &&
+      !(pending?.settingsChanged || pending?.lastOpenedChanged)) {
+    void syncWebSettingsFromCloud({force:true}).catch(error =>
+      console.warn('공유 웹 읽기 설정 확인 실패',error));
+  }
 
 }
 
@@ -3934,7 +4047,7 @@ async function ensureMobileEpubLocations(book) {
 }
 
 initializeMobilePagedReading();
-document.documentElement.dataset.readerBuild = 'v28-worker-d1';
+document.documentElement.dataset.readerBuild = 'v36-web-settings-shared';
 
 /* =========================================================
    PWA 설치 및 폴더 관리 스타일
@@ -3960,12 +4073,12 @@ document.documentElement.dataset.readerBuild = 'v28-worker-d1';
   document.head.appendChild(style);
   if ("serviceWorker" in navigator && location.protocol === "https:") {
     window.addEventListener("load", () => {
-      navigator.serviceWorker.register("./sw.js?v=28").then(reg => {
+      navigator.serviceWorker.register("./sw.js?v=36").then(reg => {
         reg.update().catch(() => {});
         // 강제로 캐시를 삭제하지 않고 새 서비스 워커 활성화 후 한 번만 다시 읽습니다.
         navigator.serviceWorker.addEventListener('controllerchange', () => {
-          if (sessionStorage.getItem('reader-v28-cloudflare-update-done') !== '1') {
-            sessionStorage.setItem('reader-v28-cloudflare-update-done','1');
+          if (sessionStorage.getItem('reader-v36-web-settings-update-done') !== '1') {
+            sessionStorage.setItem('reader-v36-web-settings-update-done','1');
             location.reload();
           }
         });
@@ -4730,8 +4843,10 @@ function initializeReaderBrightness() {
   brightnessRange.addEventListener('input', () => {
     readerState.settings.brightness = Number(brightnessRange.value);
     applyReaderBrightness();
+    markWebSettingsChanged();
     scheduleStateSave();
   });
+  brightnessRange.addEventListener('change',()=>{void saveState();});
   label.append(title,brightnessValue,brightnessRange);
   const firstLabel = settingsPanel.querySelector('label');
   if (firstLabel) firstLabel.parentNode.insertBefore(label,firstLabel);
@@ -4773,8 +4888,10 @@ async function tryResumeOfflineReaderSync({refreshBooks=true}={}) {
     await connectWorkerDrive({silent:true});
     return;
   }
-  await refreshReaderStateFromDrive();
   if(hasPendingReaderSync())await saveState();
+  try {await syncWebSettingsFromCloud();}
+  catch(error){console.warn('웹 설정 동기화 재시도 예정',error);}
+  await refreshReaderStateFromDrive();
   if(refreshBooks && libraryFolderId)await loadBooks();
 }
 
@@ -4783,6 +4900,13 @@ async function tryResumeOfflineReaderSync({refreshBooks=true}={}) {
 // 갱신 간격을 제한하여 잦은 탭 전환/화면 잠금 해제 시 호출을 합칩니다.
 window.addEventListener('focus', () => {
   if (document.hidden || !navigator.onLine || !accessToken) return;
+  if (Date.now()-webSettingsFetchedAt>15000) {
+    const pending=getPendingReaderSync();
+    if (pending?.settingsChanged || pending?.lastOpenedChanged)
+      void saveState();
+    else
+      void syncWebSettingsFromCloud().catch(error=>console.warn('웹 설정 새로고침 실패',error));
+  }
   if (Date.now() - lastReaderCloudCheckAt > 15000)
     scheduleDeferredReaderSync(isMobileReadingLayout() ? 4800 : 1300, false);
 });
@@ -4808,6 +4932,18 @@ document.addEventListener('visibilitychange', () => {
   else scheduleDeferredReaderSync();
 });
 window.addEventListener('pagehide', suspendMobileReader);
+window.addEventListener('pagehide',()=>{
+  const pending=getPendingReaderSync();
+  if (!readerApi.token || !navigator.onLine ||
+      !(pending?.settingsChanged || pending?.lastOpenedChanged)) return;
+  // keepalive is best effort: an ordinary successful settings save remains
+  // the reliable path. Incognito storage itself is not persistent.
+  void fetch(WORKER_API_URL+'/api/settings/web',{
+    method:'PUT',keepalive:true,cache:'no-store',
+    headers:{'Authorization':'Bearer '+readerApi.token,'Content-Type':'application/json'},
+    body:JSON.stringify({settings:readerState.settings,lastOpenedBookId:readerState.lastOpenedBookId})
+  }).catch(()=>{});
+});
 window.addEventListener('pageshow', () => {
   if (!document.hidden && isMobileReadingLayout()) resumeMobileReader();
 });
