@@ -2260,9 +2260,27 @@ async function loadState(){
    Browsers use a local copy only for offline fallback.
 ========================================================= */
 let readerStateUploadInFlight=null;
+// Keep the server's actual error so the web reader never suggests Google
+// sign-in for a D1 progress/settings write failure.
+let lastReaderStateSaveError='';
 async function saveState(){
-  if(!navigator.onLine || !accessToken || !cloudReaderStateReady || !hasPendingReaderSync())
+  if (!navigator.onLine) {
+    lastReaderStateSaveError='인터넷이 연결되어 있지 않습니다.';
     return false;
+  }
+  if (!readerApi.token || !accessToken) {
+    lastReaderStateSaveError='Cloudflare 서버에 기기를 연결해야 합니다.';
+    return false;
+  }
+  if (!cloudReaderStateReady) {
+    lastReaderStateSaveError='Cloudflare 서버 연결이 아직 완료되지 않았습니다.';
+    return false;
+  }
+  if (!hasPendingReaderSync()) {
+    lastReaderStateSaveError='저장할 변경사항이 없습니다.';
+    return false;
+  }
+  lastReaderStateSaveError='';
   if(readerStateUploadInFlight)return readerStateUploadInFlight;
   readerStateUploadInFlight=(async()=>{
     const pending=getPendingReaderSync();
@@ -2302,7 +2320,8 @@ async function saveState(){
       localStorage.setItem(OFFLINE_LOCAL_STATE_KEY,JSON.stringify(readerState));
       return true;
     }catch(error){
-      console.warn('읽던 위치 업로드 대기',error);
+      lastReaderStateSaveError=String(error?.message || error || '원인을 확인할 수 없습니다.');
+      console.warn('Cloudflare D1 읽던 위치 업로드 실패',error);
       updateOfflineSyncStatus('읽던 위치 기기에 저장됨 · 서버 재연결 후 동기화');
       return false;
     }
@@ -4047,7 +4066,7 @@ async function ensureMobileEpubLocations(book) {
 }
 
 initializeMobilePagedReading();
-document.documentElement.dataset.readerBuild = 'v36-web-settings-shared';
+document.documentElement.dataset.readerBuild = 'v37-cloudflare-sync-errors';
 
 /* =========================================================
    PWA 설치 및 폴더 관리 스타일
@@ -5009,7 +5028,7 @@ function initializeManualReaderSyncButton() {
     const isTxt = selectedBook.name.toLowerCase().endsWith('.txt');
     try {
       const ok = await refreshReaderStateFromDrive({applyToOpenedBook:false});
-      if (!ok) { alert('Drive에서 읽던 위치를 가져오지 못했습니다.'); return; }
+      if (!ok) { alert('Cloudflare D1에서 읽던 위치를 가져오지 못했습니다. 서버 연결을 확인해 주세요.'); return; }
       const position = structuredClone(isTxt
         ? lastFetchedDriveReadingState?.txtProgress?.[id]
         : lastFetchedDriveReadingState?.epubProgress?.[id]);
@@ -5080,8 +5099,13 @@ function initializeManualReaderSyncButton() {
     uploadButton.textContent = 'Cloudflare에 저장 중...';
     try {
       const saved = await saveState();
-      alert(saved ? '현재 책 읽던 위치를 Cloudflare에 저장했습니다.' :
-        '지금은 서버에 저장하지 못했습니다. Google 연결을 확인한 뒤 다시 시도해 주세요.');
+      if (saved) {
+        alert('현재 책 읽던 위치를 Cloudflare D1에 저장했습니다.');
+      } else {
+        const reason=lastReaderStateSaveError || '서버 연결 또는 D1 저장 상태를 확인해 주세요.';
+        alert('Cloudflare D1에 읽던 위치를 저장하지 못했습니다.\n\n원인: '+reason+
+          '\n\n서버 연결을 확인한 다음 다시 시도해 주세요.');
+      }
     } finally {
       uploadButton.disabled = false;
       uploadButton.textContent = '☁ 지금 읽던 위치 Cloudflare에 저장';
