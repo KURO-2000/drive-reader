@@ -1,4 +1,4 @@
-/* Kuro Reader Cloudflare Worker client, browser non-module.
+/* Kuro Reader Cloudflare Worker client (web v38; D1 settings sync), browser non-module.
    Never include GOOGLE_REFRESH_TOKEN, PAIRING_KEY, or OAuth secret in this file.
    Use: const api = new KuroWorkerClient('https://...workers.dev');
    await api.pair(code, 'my PC'); await api.files();
@@ -73,6 +73,16 @@
     saveProgress(fileId,device,position) {
       if (!['web','app'].includes(device)) throw new Error('device는 web 또는 app입니다.');
       return this.call('/api/progress/'+encodeURIComponent(fileId)+'/'+device,{method:'PUT',body:position});
+    }
+    getSettings(scope='web') {
+      if (!['web','app'].includes(scope)) throw new Error('web 또는 app 범위만 가능합니다.');
+      return this.call('/api/settings/'+scope);
+    }
+    saveSettings(scope='web', settings, lastOpenedBookId=null) {
+      if (!['web','app'].includes(scope)) throw new Error('web 또는 app 범위만 가능합니다.');
+      return this.call('/api/settings/'+scope,{
+        method:'PUT',body:{settings,lastOpenedBookId}
+      });
     }
     async upload(file, parentId='', onProgress=null) {
       if (!file || !Number.isSafeInteger(file.size)) throw new Error('올바른 파일을 선택하세요.');
