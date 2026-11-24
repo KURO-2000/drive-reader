@@ -1,5 +1,5 @@
 /* Kuro Reader Cloudflare Worker v28: HTML, CSS, JS, EPUB engine offline cache. */
-const CACHE_NAME = 'drive-novel-reader-v41-virtual-toc-20261124';
+const CACHE_NAME = 'drive-novel-reader-v42-continuous-toc-20261124';
 const EPUB_RUNTIME_URL = 'https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js';
 const APP_SHELL = [
   './', './index.html', './style.css', './worker_client.js', './app.js',

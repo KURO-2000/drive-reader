@@ -1096,72 +1096,88 @@ function renderTxtChapter(
    TXT 목차
 ========================================================= */
 
+// v42: 목차는 하나의 연속 목록입니다. 수천 개 장도 ‘다음 목차’ 버튼 없이
+// 스크롤할 수 있도록 대용량 TXT에만 가상 스크롤을 사용합니다.
 function renderTxtToc() {
   tocSection.classList.remove('hidden');
-  tocList.innerHTML = '';
+  tocList.replaceChildren();
   const total = txtChapters.length;
-  // A 40 MB TXT can have ~10,000 synthetic chapters. Only render a
-  // navigable window, not 10,000 DOM buttons on every chapter turn.
-  const windowSize = 160;
-  const paged = total > 300;
-  const start = paged ? Math.max(0,
-    Math.min(total - windowSize, currentTxtChapter - Math.floor(windowSize / 2))) : 0;
-  const end = paged ? Math.min(total, start + windowSize) : total;
+  const current = Math.max(0, Math.min(total - 1, currentTxtChapter));
 
-  if (paged) {
-    const controls = document.createElement('div');
-    controls.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:6px 0 10px';
-    const count = document.createElement('span');
-    count.textContent = `${start + 1}~${end} / ${total}장`;
-    controls.appendChild(count);
-    const jump = document.createElement('input');
-    jump.type = 'number';
-    jump.min = '1'; jump.max = String(total);
-    jump.value = String(currentTxtChapter + 1);
-    jump.setAttribute('aria-label','이동할 장 번호');
-    jump.style.cssText = 'width:70px;min-width:0;padding:5px;font-size:14px';
-    const go = document.createElement('button');
-    go.textContent = '이동';
-    go.className = 'toc-item';
-    go.style.cssText = 'width:auto;padding:5px 8px';
-    const navigate = () => {
-      const requested = Number(jump.value);
-      if (Number.isInteger(requested) && requested >= 1 && requested <= total) {
-        void moveTxtChapter(requested - 1);
-      }
-    };
-    go.addEventListener('click', navigate);
-    jump.addEventListener('keydown', e => {if (e.key === 'Enter') navigate();});
-    controls.appendChild(jump); controls.appendChild(go);
-    tocList.appendChild(controls);
-    const rangeButton = (text, index) => {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = 'toc-item';
-      button.textContent = text;
-      button.addEventListener('click', () => {void moveTxtChapter(index);});
-      tocList.appendChild(button);
-    };
-    if (start > 0) rangeButton(`↑ 이전 목차 (${Math.max(1,start - windowSize + 1)}장부터)`,
-      Math.max(0,start - windowSize));
-  }
-  for (let index = start; index < end; index++) {
+  function makeChapterButton(index) {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'toc-item';
-    if (index === currentTxtChapter) button.classList.add('active');
+    if (index === current) button.classList.add('active');
     button.textContent = txtChapters[index].title;
-    button.addEventListener('click', () => {void moveTxtChapter(index);});
-    tocList.appendChild(button);
+    button.addEventListener('click', () => { void moveTxtChapter(index); });
+    return button;
   }
-  if (paged && end < total) {
-    const next = document.createElement('button');
-    next.type = 'button';
-    next.className = 'toc-item';
-    next.textContent = `↓ 다음 목차 (${end + 1}장부터)`;
-    next.addEventListener('click', () => {void moveTxtChapter(end);});
-    tocList.appendChild(next);
+
+  // 보통 길이의 TXT는 모든 장을 DOM에 그대로 표시합니다.
+  if (total <= 300) {
+    const fragment = document.createDocumentFragment();
+    for (let index = 0; index < total; index++) {
+      fragment.appendChild(makeChapterButton(index));
+    }
+    tocList.appendChild(fragment);
+    return;
   }
+
+  // 대용량 TXT: 전체 높이는 모든 장의 높이와 같지만 실제 버튼은
+  // 화면 주변 항목만 생성합니다. 사용자에게는 1장부터 마지막 장까지
+  // 중간 버튼 없이 이어지는 하나의 스크롤 목록으로 동작합니다.
+  const ITEM_HEIGHT = 48;
+  const OVERSCAN = 10;
+  const viewport = document.createElement('div');
+  viewport.style.cssText = [
+    'height:min(65vh,620px)', 'min-height:240px', 'overflow-y:auto',
+    'overscroll-behavior:contain', 'position:relative', 'width:100%'
+  ].join(';');
+  viewport.setAttribute('aria-label', `전체 목차 ${total}장`);
+  const canvas = document.createElement('div');
+  canvas.style.cssText = `position:relative;width:100%;height:${total * ITEM_HEIGHT}px`;
+  viewport.appendChild(canvas);
+  tocList.appendChild(viewport);
+
+  let lastStart = -1;
+  let lastEnd = -1;
+  function drawVisible() {
+    if (!viewport.isConnected) return;
+    const visibleHeight = viewport.clientHeight || 620;
+    const first = Math.max(0, Math.floor(viewport.scrollTop / ITEM_HEIGHT) - OVERSCAN);
+    const end = Math.min(total,
+      Math.ceil((viewport.scrollTop + visibleHeight) / ITEM_HEIGHT) + OVERSCAN);
+    if (first === lastStart && end === lastEnd) return;
+    lastStart = first;
+    lastEnd = end;
+    const fragment = document.createDocumentFragment();
+    for (let index = first; index < end; index++) {
+      const button = makeChapterButton(index);
+      button.style.cssText = [
+        'position:absolute', 'left:0', 'right:0', `top:${index * ITEM_HEIGHT}px`,
+        `height:${ITEM_HEIGHT}px`, `min-height:${ITEM_HEIGHT}px`,
+        'box-sizing:border-box', 'margin:0', 'width:100%',
+        'white-space:nowrap', 'text-overflow:ellipsis', 'overflow:hidden',
+        'text-align:left'
+      ].join(';');
+      fragment.appendChild(button);
+    }
+    canvas.replaceChildren(fragment);
+  }
+
+  let pendingFrame = 0;
+  viewport.addEventListener('scroll', () => {
+    if (pendingFrame) return;
+    pendingFrame = requestAnimationFrame(() => {
+      pendingFrame = 0;
+      drawVisible();
+    });
+  }, {passive:true});
+
+  // 처음 열었을 때 현재 읽는 장이 보이도록 이동합니다.
+  viewport.scrollTop = Math.max(0, current * ITEM_HEIGHT - ITEM_HEIGHT * 3);
+  drawVisible();
 }
 
 
