@@ -57,6 +57,12 @@ let appReadingProgressSnapshot = {txtProgress:{}, epubProgress:{}};
 function compareFurthestTxtProgress(a, b) {
   if (!a) return b ? -1 : 0;
   if (!b) return 1;
+  const absA = Number(a.absoluteCharOffset);
+  const absB = Number(b.absoluteCharOffset);
+  if (a.absoluteCharOffset != null && b.absoluteCharOffset != null &&
+      Number.isFinite(absA) && Number.isFinite(absB)) {
+    return Math.sign(absA - absB);
+  }
   const ca = Number(a.chapterIndex ?? 0);
   const cb = Number(b.chapterIndex ?? 0);
   if (ca !== cb) return Math.sign(ca - cb);
@@ -818,15 +824,14 @@ async function openTxtBook(book) {
   buildMobileTxtLengthIndex();
 
 
-  const originalSiteProgress = normalizeVirtualTxtProgress(
+  const originalSiteProgress = canonicalTxtPosition(
     readerState.txtProgress[book.id] || null, txtChapters, true);
   const appTxtPosition = (navigator.onLine && accessToken)
-    ? normalizeVirtualTxtProgress(appReadingProgressSnapshot.txtProgress[book.id], txtChapters, false)
+    ? canonicalTxtPosition(appReadingProgressSnapshot.txtProgress[book.id] || null,txtChapters,false)
     : null;
-  const progress = furthestTxtProgress(originalSiteProgress, appTxtPosition);
+  const progress = furthestTxtProgress(originalSiteProgress, appTxtPosition) || newTxtPosition(0,0);
   const openedFurtherThanSite = !!appTxtPosition &&
-    (!originalSiteProgress || compareFurthestTxtProgress(
-      appTxtPosition, originalSiteProgress) > 0);
+    (!originalSiteProgress || compareFurthestTxtProgress(appTxtPosition, originalSiteProgress) > 0);
   // The website is now displaying this location. Its own last-read pointer
   // may advance, but this does NOT write into Android's separate slot.
   readerState.txtProgress[book.id] = {...progress};
@@ -919,11 +924,22 @@ async function decodeNovelTxtResponse(response) {
 const VIRTUAL_TXT_CHAPTER_CHARS = 4000;
 const VIRTUAL_TXT_CHAPTER_VERSION = 41;
 
+// v43: Android's streaming LineSplitter and the website use the same
+// displayed-text coordinates: normalize CRLF/CR -> LF, skip isolated ##...
+// formatting lines, keep all remaining whitespace and preface text. This
+// makes absoluteCharOffset independent of TOC boundaries and screen size.
+function normalizeTxtForProgress(text) {
+  const lines = String(text || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n')
+    .filter(line => !/^#{2,6}$/.test(line.trim()));
+  // Dart LineSplitter doesn't add a final empty line after terminal LF.
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  return lines.join('\n');
+}
+
 function splitTxtIntoVirtualChapters(text) {
   const chapters = [];
   for (let start = 0; start < text.length;) {
     let end = Math.min(text.length, start + VIRTUAL_TXT_CHAPTER_CHARS);
-    // Dart app's segmenter also protects UTF-16 surrogate pairs.
     if (end < text.length && end > start) {
       const previous = text.charCodeAt(end - 1);
       if (previous >= 0xD800 && previous <= 0xDBFF) end--;
@@ -932,51 +948,91 @@ function splitTxtIntoVirtualChapters(text) {
     chapters.push({
       title: `${chapters.length + 1}장`,
       content: text.slice(start, end),
+      startOffset: start,
       virtualChapter: true
     });
     start = end;
   }
-  if (chapters.length === 0) chapters.push({title:'1장', content:'', virtualChapter:true});
+  if (!chapters.length) chapters.push({title:'1장', content:'', startOffset:0, virtualChapter:true});
   return chapters;
 }
 
-function isTxtChapterHeading(line) {
-  let title = line.trim().replace(/^#{1,6}\s*/, '').replace(/\s*#{1,6}$/, '').trim();
-  if (!title || title.length > 100) return false;
-  if (/^第\s*[0-9０-９零〇一二三四五六七八九十百千万萬兩两]+\s*[章节章節卷巻话話回篇部][^。！？!?；;\r\n]{0,55}$/i.test(title)) return true;
-  return /^(?:(?:Chapter\s+\d+)|序章|序言|楔子|前言|终章|終章|后记|後記|番外(?:篇)?)(?:[\s：:\-—　].*)?$/i.test(title);
+function txtHeadingTitle(line) {
+  const title = line.trim().replace(/^#{1,6}\s*/, '').replace(/\s*#{1,6}$/, '').trim();
+  if (!title || title.length > 100) return null;
+  if (/^第\s*[0-9０-９零〇一二三四五六七八九十百千万萬兩两]+\s*[章节章節卷巻话話回篇部][^。！？!?；;\r\n]{0,55}$/i.test(title)) return title;
+  if (/^(?:Chapter\s+\d+|序章|序言|楔子|前言|终章|終章|后记|後記|番外(?:篇)?)(?:[\s：:\-—　].*)?$/i.test(title)) return title;
+  return null;
 }
 
+function isTxtChapterHeading(line) { return txtHeadingTitle(line) !== null; }
+
 function splitTxtIntoChapters(text) {
-  // Match Android v40+ behavior: standalone Markdown ### separators are not
-  // chapter text. Keep all other original characters (including bare 1/2).
-  const lines = text.replace(/\r\n/g, '\n').split('\n')
-    .filter(line => !/^#{2,6}$/.test(line.trim()));
-  const normalized = lines.join('\n');
-  const positions = [];
-  for (let index = 0; index < lines.length; index++) {
-    if (isTxtChapterHeading(lines[index])) positions.push(index);
+  const normalized = normalizeTxtForProgress(text);
+  const lines = normalized.split('\n');
+  const headings = [];
+  let cursor = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const title = txtHeadingTitle(lines[i]);
+    if (title) headings.push({start:cursor, title});
+    cursor += lines[i].length + (i + 1 < lines.length ? 1 : 0);
   }
-  // One isolated heading in a long book cannot establish a TOC; use virtual
-  // chapters instead. Files with multiple recognizable chapters retain titles.
-  if (positions.length < 2) {
-    if (!positions.length || normalized.length > VIRTUAL_TXT_CHAPTER_CHARS) {
-      return splitTxtIntoVirtualChapters(normalized);
-    }
+  // With zero or one title, long texts use fixed-size virtual chapters.
+  if (headings.length === 0 || (headings.length === 1 && normalized.length > VIRTUAL_TXT_CHAPTER_CHARS)) {
+    return splitTxtIntoVirtualChapters(normalized);
   }
+  // Preface stays inside the FIRST actual chapter, as in Android v40+.
   const chapters = [];
-  if (positions.length && positions[0] > 0) {
-    const intro = lines.slice(0, positions[0]).join('\n').trim();
-    if (intro) chapters.push({title:'前文', content:intro});
+  for (let i = 0; i < headings.length; i++) {
+    const start = i === 0 ? 0 : headings[i].start;
+    const end = i + 1 < headings.length ? headings[i + 1].start : normalized.length;
+    chapters.push({title:headings[i].title, content:normalized.slice(start,end), startOffset:start});
   }
-  positions.forEach((start, index) => {
-    const end = index + 1 < positions.length ? positions[index + 1] : lines.length;
-    chapters.push({
-      title: lines[start].trim().replace(/^#{1,6}\s*/, '').replace(/\s*#{1,6}$/, '').trim(),
-      content: lines.slice(start, end).join('\n').trim()
-    });
-  });
   return chapters.length ? chapters : splitTxtIntoVirtualChapters(normalized);
+}
+
+// Resolve a single canonical UTF-16 offset to the current chapter/index.
+// Old D1 positions are migrated in memory only; never rewrite the app slot.
+function canonicalTxtPosition(position, chapters=txtChapters, isWebSlot=false) {
+  if (!position || !chapters?.length) return position;
+  const legacy = normalizeVirtualTxtProgress(position, chapters, isWebSlot);
+  const total = chapters[chapters.length-1].startOffset + chapters[chapters.length-1].content.length;
+  let absolute = Number(legacy.absoluteCharOffset);
+  if (legacy.absoluteCharOffset == null || !Number.isFinite(absolute)) {
+    const chapterIndex = Math.max(0, Math.min(chapters.length-1, Number(legacy.chapterIndex)||0));
+    const chapter = chapters[chapterIndex];
+    let offset = Number(legacy.charOffset);
+    if (legacy.charOffset == null || !Number.isFinite(offset) ||
+        (offset === 0 && Number(legacy.pageRatio ?? legacy.scrollRatio ?? 0) > 0)) {
+      offset = chapter.content.length * Number(legacy.pageRatio ?? legacy.scrollRatio ?? 0);
+    }
+    absolute = chapter.startOffset + Math.max(0, Math.min(chapter.content.length, Math.round(offset)));
+  }
+  absolute = Math.max(0, Math.min(total, Math.round(absolute)));
+  let lo = 0, hi = chapters.length-1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo+hi)/2);
+    if (chapters[mid].startOffset <= absolute) lo = mid;
+    else hi = mid-1;
+  }
+  const chapter = chapters[lo];
+  const offset = Math.max(0, Math.min(chapter.content.length, absolute - chapter.startOffset));
+  const ratio = chapter.content.length ? offset / chapter.content.length : 0;
+  return {...legacy, chapterIndex:lo, charOffset:offset,
+    absoluteCharOffset:absolute, txtOffsetVersion:1,
+    chapterMapVersion:chapters[0]?.virtualChapter ? VIRTUAL_TXT_CHAPTER_VERSION : undefined,
+    scrollRatio:ratio, pageRatio:ratio};
+}
+
+function newTxtPosition(chapterIndex, charOffset) {
+  const index = Math.max(0, Math.min(txtChapters.length-1, chapterIndex));
+  const chapter = txtChapters[index];
+  const offset = Math.max(0, Math.min(chapter.content.length, Math.round(Number(charOffset)||0)));
+  const ratio = chapter.content.length ? offset / chapter.content.length : 0;
+  return {chapterIndex:index, charOffset:offset,
+    absoluteCharOffset:chapter.startOffset+offset, txtOffsetVersion:1,
+    chapterMapVersion:txtChapters[0]?.virtualChapter ? VIRTUAL_TXT_CHAPTER_VERSION : undefined,
+    scrollRatio:ratio,pageRatio:ratio};
 }
 
 // Old single-chapter reading offsets were measured from the entire book.
@@ -1077,7 +1133,12 @@ function renderTxtChapter(
           } else if (isMobilePagedReading()) {
             finishMobileTxtRender(restoreRatio);
           } else {
-            txtScrollArea.scrollTop = max > 0 ? max * restoreRatio : 0;
+            const position=readerState.txtProgress?.[selectedBook?.id];
+            const sameChapter=Number(position?.chapterIndex)===currentTxtChapter;
+            if (!sameChapter || position?.charOffset==null ||
+                !restoreTxtDesktopOffset(position.charOffset)) {
+              txtScrollArea.scrollTop = max > 0 ? max * restoreRatio : 0;
+            }
           }
 
         }
@@ -1224,11 +1285,8 @@ async function moveTxtChapter(
       selectedBook.id
     ] = {
 
-      chapterIndex:
-        currentTxtChapter,
-      chapterMapVersion: txtChapters[0]?.virtualChapter ? VIRTUAL_TXT_CHAPTER_VERSION : undefined,
-      scrollRatio: restoreRatio,
-      pageRatio: restoreRatio
+      ...newTxtPosition(currentTxtChapter,
+        txtChapters[currentTxtChapter].content.length * Math.max(0,Math.min(1,restoreRatio)))
 
     };
 
@@ -1302,6 +1360,46 @@ txtScrollArea.addEventListener(
 );
 
 
+// Desktop: binary-search the first glyph visible at the top of the viewport.
+// This tracks text offsets rather than proportional scrollbar pixels; width
+// and font size changes therefore do not shift the saved location.
+function txtDesktopVisibleOffset() {
+  const node = txtContent.firstChild;
+  const chapter = txtChapters[currentTxtChapter];
+  if (!node || node.nodeType !== Node.TEXT_NODE || !chapter) return 0;
+  const length = node.textContent?.length || 0;
+  if (txtScrollArea.scrollTop <= 0 || length === 0) return 0;
+  if (txtScrollArea.scrollTop >= txtScrollArea.scrollHeight - txtScrollArea.clientHeight - 2)
+    return Math.max(0,length-1);
+  const top = txtScrollArea.getBoundingClientRect().top + 2;
+  const range = document.createRange();
+  let low=0, high=length-1;
+  while (low<high) {
+    const middle=Math.floor((low+high)/2);
+    range.setStart(node,middle);
+    range.setEnd(node,Math.min(length,middle+1));
+    const box=range.getBoundingClientRect();
+    if (!box.height || box.bottom < top) low=middle+1;
+    else high=middle;
+  }
+  return low;
+}
+
+function restoreTxtDesktopOffset(offset) {
+  const node=txtContent.firstChild;
+  const len=node?.textContent?.length || 0;
+  if (!node || node.nodeType!==Node.TEXT_NODE || !len) return false;
+  const index=Math.max(0,Math.min(len-1,Math.round(Number(offset)||0)));
+  const range=document.createRange();
+  range.setStart(node,index);
+  range.setEnd(node,Math.min(len,index+1));
+  const target=range.getBoundingClientRect();
+  const container=txtScrollArea.getBoundingClientRect();
+  if (!target.height) return false;
+  txtScrollArea.scrollTop += target.top-container.top;
+  return true;
+}
+
 function saveTxtScroll() {
 
   if (isMobilePagedReading() && isMobileTxtBook()) {
@@ -1327,19 +1425,8 @@ function saveTxtScroll() {
       0;
 
 
-  readerState
-    .txtProgress[
-      selectedBook.id
-    ] = {
-
-      chapterIndex:
-        currentTxtChapter,
-      chapterMapVersion: txtChapters[0]?.virtualChapter ? VIRTUAL_TXT_CHAPTER_VERSION : undefined,
-      scrollRatio:
-        ratio
-
-    };
-
+  readerState.txtProgress[selectedBook.id] = newTxtPosition(
+    currentTxtChapter, txtDesktopVisibleOffset());
 
   scheduleStateSave();
 
@@ -2023,6 +2110,11 @@ function isSameBookPosition(a, b) {
 /* v16: 휴대폰의 오래된 동기화 대기 기록이 PC의 더 앞선 장을 덮어쓰지 않도록 합니다. */
 function readerPositionOrder(a, b) {
   if (!a || !b) return null;
+  if (a.absoluteCharOffset != null && b.absoluteCharOffset != null &&
+      Number.isFinite(Number(a.absoluteCharOffset)) &&
+      Number.isFinite(Number(b.absoluteCharOffset))) {
+    return Math.sign(Number(a.absoluteCharOffset) - Number(b.absoluteCharOffset));
+  }
   if (Number.isFinite(Number(a.chapterIndex)) && Number.isFinite(Number(b.chapterIndex))) {
     const ac = Number(a.chapterIndex), bc = Number(b.chapterIndex);
     if (ac !== bc) return Math.sign(ac - bc);
@@ -2130,7 +2222,11 @@ async function refreshReaderStateFromDrive({applyToOpenedBook=true,bookId=null}=
     const startMutation=readerProgressMutationCounter;
     try {
       const result=await readerApi.getProgress(id);
-      const app=result.app||null, web=result.web||null;
+      let app=result.app||null, web=result.web||null;
+      if (selectedBook?.id===id && selectedBook?.name?.toLowerCase().endsWith('.txt') && txtChapters?.length) {
+        if (app && !app.cfi) app=canonicalTxtPosition(app,txtChapters,false);
+        if (web && !web.cfi) web=canonicalTxtPosition(web,txtChapters,true);
+      }
       if(app){
         if(app.cfi||app.format==='epub')appReadingProgressSnapshot.epubProgress[id]=app;
         else appReadingProgressSnapshot.txtProgress[id]=app;
@@ -2289,10 +2385,12 @@ async function saveState(){
         const position=txt||epub;
         if(!position)continue;
         const remote=await readerApi.getProgress(id);
-        if(txt && remote.web && !remote.web.cfi &&
-            compareFurthestTxtProgress(remote.web,txt)>0){
+        const otherWeb = txt && selectedBook?.id===id && txtChapters?.length && remote.web
+          ? canonicalTxtPosition(remote.web,txtChapters,true) : remote.web;
+        if(txt && otherWeb && !otherWeb.cfi &&
+            compareFurthestTxtProgress(otherWeb,txt)>0){
           // 이전 기기의 더 앞선 진도를 덮어쓰지 않습니다.
-          readerState.txtProgress[id]=structuredClone(remote.web);
+          readerState.txtProgress[id]=structuredClone(otherWeb);
         }else if(epub && remote.web?.cfi){
           const c=compareEpubProgressCFI(epub,remote.web);
           if(c!==null && c<0)readerState.epubProgress[id]=structuredClone(remote.web);
@@ -3065,12 +3163,9 @@ function rememberMobileTxtProgress() {
   if (!isMobilePagedReading() || !isMobileTxtBook()) return;
   const ratio = mobilePageState.txtPages <= 1 ? 0 :
     mobilePageState.txtPageIndex / (mobilePageState.txtPages - 1);
-  readerState.txtProgress[selectedBook.id] = {
-    chapterIndex:currentTxtChapter,
-    chapterMapVersion: txtChapters[0]?.virtualChapter ? VIRTUAL_TXT_CHAPTER_VERSION : undefined,
-    scrollRatio:ratio,
-    pageRatio:ratio
-  };
+  readerState.txtProgress[selectedBook.id] = newTxtPosition(
+    currentTxtChapter,
+    txtChapters[currentTxtChapter].content.length * ratio);
   scheduleStateSave();
 }
 
@@ -4283,13 +4378,8 @@ function saveVirtualMobileTxtProgress() {
   const length = Math.max(1, txtChapters[currentTxtChapter]?.content.length || 1);
   const offset = virtualTxtCurrentOffset();
   const ratio = offset / length;
-  readerState.txtProgress[selectedBook.id] = {
-    chapterIndex: currentTxtChapter,
-    chapterMapVersion: txtChapters[0]?.virtualChapter ? VIRTUAL_TXT_CHAPTER_VERSION : undefined,
-    charOffset: offset,
-    scrollRatio: ratio,
-    pageRatio: ratio
-  };
+  readerState.txtProgress[selectedBook.id] = newTxtPosition(
+    currentTxtChapter, offset);
   scheduleStateSave();
 }
 
@@ -4462,7 +4552,7 @@ const OFFLINE_READER_DB = "drive-novel-offline-v1";
 const OFFLINE_READER_STORE = "books";
 const TXT_PARSED_STORE = "txtChapters";
 const TXT_LAYOUT_STORE = "txtLayouts";
-const TXT_CACHE_FORMAT_VERSION = 16; // v41: 원본 TXT에서 가상 목차 다시 생성
+const TXT_CACHE_FORMAT_VERSION = 17; // v43: unified absolute TXT offsets + normalized chapters
 const OFFLINE_BOOK_INDEX_KEY = "driveReaderOfflineBookIndexV1";
 const OFFLINE_LOCAL_STATE_KEY = "driveReaderLastLocalStateV1";
 const OFFLINE_PENDING_STATE_KEY = "driveReaderPendingSyncV1";
