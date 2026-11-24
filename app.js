@@ -57,6 +57,13 @@ let appReadingProgressSnapshot = {txtProgress:{}, epubProgress:{}};
 function compareFurthestTxtProgress(a, b) {
   if (!a) return b ? -1 : 0;
   if (!b) return 1;
+  // Explicit manual saves supersede all positions from an older generation.
+  const ma = Number(a.manualOverrideAt || 0), mb = Number(b.manualOverrideAt || 0);
+  if (ma !== mb) return Math.sign(ma - mb);
+  if (ma > 0) {
+    const ta = Number(a.userUpdatedAt || 0), tb = Number(b.userUpdatedAt || 0);
+    if (ta !== tb) return Math.sign(ta - tb);
+  }
   const absA = Number(a.absoluteCharOffset);
   const absB = Number(b.absoluteCharOffset);
   if (a.absoluteCharOffset != null && b.absoluteCharOffset != null &&
@@ -1029,7 +1036,9 @@ function newTxtPosition(chapterIndex, charOffset) {
   const chapter = txtChapters[index];
   const offset = Math.max(0, Math.min(chapter.content.length, Math.round(Number(charOffset)||0)));
   const ratio = chapter.content.length ? offset / chapter.content.length : 0;
+  const old = selectedBook?.id ? readerState.txtProgress?.[selectedBook.id] : null;
   return {chapterIndex:index, charOffset:offset,
+    ...(Number(old?.manualOverrideAt || 0) > 0 ? {manualOverrideAt:Number(old.manualOverrideAt)} : {}),
     absoluteCharOffset:chapter.startOffset+offset, txtOffsetVersion:1,
     chapterMapVersion:txtChapters[0]?.virtualChapter ? VIRTUAL_TXT_CHAPTER_VERSION : undefined,
     scrollRatio:ratio,pageRatio:ratio};
@@ -2133,6 +2142,9 @@ function readerPositionOrder(a, b) {
 function compareCloudAndDeviceProgress(device, cloud) {
   if (!device) return cloud ? 'cloud' : 'same';
   if (!cloud) return 'device';
+  const dm = Number(device.manualOverrideAt || 0);
+  const cm = Number(cloud.manualOverrideAt || 0);
+  if (dm !== cm) return dm > cm ? 'device' : 'cloud';
   const dTrusted = Number(device.userUpdatedAt || 0);
   const cTrusted = Number(cloud.userUpdatedAt || 0);
   if (dTrusted && cTrusted && dTrusted !== cTrusted) {
@@ -5155,44 +5167,62 @@ function initializeManualReaderSyncButton() {
   uploadButton.style.cssText = button.style.cssText;
   uploadButton.addEventListener('click', async () => {
     if (!selectedBook) { alert('먼저 책을 열어주세요.'); return; }
-    if (!navigator.onLine || !accessToken) {
+    if (!navigator.onLine || !accessToken || !readerApi.token) {
       alert('인터넷과 Cloudflare 서버 연결이 필요합니다.'); return;
     }
+    uploadButton.disabled = true;
+    uploadButton.textContent = '기존 서버 위치 덮어쓰는 중...';
     const id = selectedBook.id;
     const isTxt = selectedBook.name.toLowerCase().endsWith('.txt');
-    if (isTxt && !isMobilePagedReading()) saveTxtScroll();
-    const position = isTxt ? readerState.txtProgress?.[id] : readerState.epubProgress?.[id];
-    if (!position) { alert('저장할 읽던 위치가 없습니다.'); return; }
-    const now = Date.now();
-    position.updatedAt = now;
-    position.userUpdatedAt = now;
-    let pending = getPendingReaderSync();
-    if (pending?.schemaVersion !== 4) pending = {
-      schemaVersion:4,bookIds:{},explicitBookIds:{},settingsChanged:false,
-      lastOpenedChanged:false
-    };
-    pending.bookIds ||= {};
-    pending.explicitBookIds ||= {};
-    pending.bookIds[id] = now;
-    pending.explicitBookIds[id] = true;
-    pending.version = now + Math.random();
-    pending.state = JSON.parse(JSON.stringify(readerState));
-    pending.lastOpenedBookId = readerState.lastOpenedBookId;
-    pending.settings = readerState.settings;
-    localStorage.setItem(OFFLINE_PENDING_STATE_KEY, JSON.stringify(pending));
-    localStorage.setItem(OFFLINE_LOCAL_STATE_KEY, JSON.stringify(readerState));
-    readerProgressMutationCounter++;
-    uploadButton.disabled = true;
-    uploadButton.textContent = 'Cloudflare에 저장 중...';
     try {
-      const saved = await saveState();
-      if (saved) {
-        alert('현재 책 읽던 위치를 Cloudflare D1에 저장했습니다.');
-      } else {
-        const reason=lastReaderStateSaveError || '서버 연결 또는 D1 저장 상태를 확인해 주세요.';
-        alert('Cloudflare D1에 읽던 위치를 저장하지 못했습니다.\n\n원인: '+reason+
-          '\n\n서버 연결을 확인한 다음 다시 시도해 주세요.');
+      // Finish an earlier upload before writing the explicit checkpoint.
+      clearTimeout(stateSaveTimer);
+      if (readerStateUploadInFlight) await readerStateUploadInFlight;
+      if (isTxt) {
+        if (isMobilePagedReading()) rememberMobileTxtProgress();
+        else saveTxtScroll();
       }
+      // saveTxtScroll schedules a normal upload; cancel it while overriding.
+      clearTimeout(stateSaveTimer);
+      const current = isTxt ? readerState.txtProgress?.[id] : readerState.epubProgress?.[id];
+      if (!current) throw new Error('저장할 읽던 위치가 없습니다.');
+      const now = Date.now();
+      const position = {
+        ...(isTxt ? canonicalTxtPosition(current, txtChapters, true) : current),
+        format:isTxt ? 'txt' : 'epub',
+        manualOverrideAt:now, updatedAt:now, userUpdatedAt:now,
+      };
+      // Replace BOTH D1 slots for this book, not unrelated books or settings.
+      await readerApi.saveProgress(id,'web',position);
+      await readerApi.saveProgress(id,'app',position);
+      const verified = await readerApi.getProgress(id);
+      if (Number(verified.web?.manualOverrideAt) !== now ||
+          Number(verified.app?.manualOverrideAt) !== now) {
+        throw new Error('새로운 앱·웹 서버 위치 확인에 실패했습니다.');
+      }
+      const key = isTxt ? 'txtProgress' : 'epubProgress';
+      readerState[key][id] = structuredClone(position);
+      appReadingProgressSnapshot[key][id] = structuredClone(position);
+      lastFetchedDriveReadingState ||= normalizeReaderCloudState({});
+      lastFetchedDriveReadingState[key][id] = structuredClone(position);
+      const pending = getPendingReaderSync();
+      if (pending?.bookIds) {
+        delete pending.bookIds[id];
+        delete pending.explicitBookIds?.[id];
+        if (pending.state?.[key]) pending.state[key][id] = structuredClone(position);
+        pending.version = Date.now() + Math.random();
+        if (!Object.keys(pending.bookIds).length && !pending.settingsChanged &&
+            !pending.lastOpenedChanged) localStorage.removeItem(OFFLINE_PENDING_STATE_KEY);
+        else localStorage.setItem(OFFLINE_PENDING_STATE_KEY,JSON.stringify(pending));
+      }
+      readerProgressMutationCounter++;
+      localStorage.setItem(OFFLINE_LOCAL_STATE_KEY, JSON.stringify(readerState));
+      alert('현재 위치로 이 책의 이전 앱·웹 서버 기록을 덮어썼습니다.\n' +
+        '서버 위치로 이동해도 방금 저장한 위치가 열립니다.');
+    } catch (error) {
+      console.error('Cloudflare 수동 덮어쓰기 실패',error);
+      alert('수동 저장이 완료되지 않았습니다.\n원인: '+String(error?.message||error)+
+        '\n일부 기록만 갱신됐을 수 있으니 다시 저장해 주세요.');
     } finally {
       uploadButton.disabled = false;
       uploadButton.textContent = '☁ 지금 읽던 위치 Cloudflare에 저장';
