@@ -818,9 +818,11 @@ async function openTxtBook(book) {
   buildMobileTxtLengthIndex();
 
 
-  const originalSiteProgress = readerState.txtProgress[book.id] || null;
+  const originalSiteProgress = normalizeVirtualTxtProgress(
+    readerState.txtProgress[book.id] || null, txtChapters, true);
   const appTxtPosition = (navigator.onLine && accessToken)
-    ? appReadingProgressSnapshot.txtProgress[book.id] : null;
+    ? normalizeVirtualTxtProgress(appReadingProgressSnapshot.txtProgress[book.id], txtChapters, false)
+    : null;
   const progress = furthestTxtProgress(originalSiteProgress, appTxtPosition);
   const openedFurtherThanSite = !!appTxtPosition &&
     (!originalSiteProgress || compareFurthestTxtProgress(
@@ -910,144 +912,113 @@ async function decodeNovelTxtResponse(response) {
    TXT 자동 장 분리
 ========================================================= */
 
-function splitTxtIntoChapters(
-  text
-) {
+// v41: When actual chapter headings cannot be recognized, the same stable
+// 4000-UTF16-character segments used by Android become entries in the TOC.
+// This is intentionally approximate (~32 pages on the reported phone setup):
+// the number of display pages always depends on viewport, font and spacing.
+const VIRTUAL_TXT_CHAPTER_CHARS = 4000;
+const VIRTUAL_TXT_CHAPTER_VERSION = 41;
 
-  const normalized =
-    text.replace(
-      /\r\n/g,
-      "\n"
-    );
-
-
-  const lines =
-    normalized.split("\n");
-
-
-  const chapterRegex =
-    /^\s*(?:(?:第\s*[0-9０-９零〇一二三四五六七八九十百千万萬兩两]+\s*[章节章節卷巻话話回篇部])|(?:Chapter\s+\d+)|(?:CHAPTER\s+\d+)|序章|序言|楔子|前言|终章|終章|后记|後記|番外(?:篇)?)(?:[\s：:\-—　].*)?\s*$/i;
-
-
-  const positions = [];
-
-
-  lines.forEach(
-    (line, index) => {
-
-      if (
-        chapterRegex.test(
-          line.trim()
-        )
-      ) {
-
-        positions.push(
-          index
-        );
-
-      }
-
-    }
-  );
-
-
-  if (
-    positions.length === 0
-  ) {
-
-    return [
-
-      {
-
-        title: "全文",
-
-        content:
-          normalized
-
-      }
-
-    ];
-
-  }
-
-
+function splitTxtIntoVirtualChapters(text) {
   const chapters = [];
-
-
-  if (
-    positions[0] > 0
-  ) {
-
-    const intro =
-      lines
-        .slice(
-          0,
-          positions[0]
-        )
-        .join("\n")
-        .trim();
-
-
-    if (intro) {
-
-      chapters.push({
-
-        title: "前文",
-
-        content: intro
-
-      });
-
+  for (let start = 0; start < text.length;) {
+    let end = Math.min(text.length, start + VIRTUAL_TXT_CHAPTER_CHARS);
+    // Dart app's segmenter also protects UTF-16 surrogate pairs.
+    if (end < text.length && end > start) {
+      const previous = text.charCodeAt(end - 1);
+      if (previous >= 0xD800 && previous <= 0xDBFF) end--;
     }
-
+    if (end <= start) end = Math.min(text.length, start + 1);
+    chapters.push({
+      title: `${chapters.length + 1}장`,
+      content: text.slice(start, end),
+      virtualChapter: true
+    });
+    start = end;
   }
-
-
-  positions.forEach(
-    (start, index) => {
-
-      const end =
-        index + 1 <
-        positions.length
-
-          ?
-
-          positions[index + 1]
-
-          :
-
-          lines.length;
-
-
-      const title =
-        lines[start]
-          .trim();
-
-
-      const content =
-        lines
-          .slice(
-            start,
-            end
-          )
-          .join("\n")
-          .trim();
-
-
-      chapters.push({
-
-        title,
-
-        content
-
-      });
-
-    }
-  );
-
-
+  if (chapters.length === 0) chapters.push({title:'1장', content:'', virtualChapter:true});
   return chapters;
+}
 
+function isTxtChapterHeading(line) {
+  let title = line.trim().replace(/^#{1,6}\s*/, '').replace(/\s*#{1,6}$/, '').trim();
+  if (!title || title.length > 100) return false;
+  if (/^第\s*[0-9０-９零〇一二三四五六七八九十百千万萬兩两]+\s*[章节章節卷巻话話回篇部][^。！？!?；;\r\n]{0,55}$/i.test(title)) return true;
+  return /^(?:(?:Chapter\s+\d+)|序章|序言|楔子|前言|终章|終章|后记|後記|番外(?:篇)?)(?:[\s：:\-—　].*)?$/i.test(title);
+}
+
+function splitTxtIntoChapters(text) {
+  // Match Android v40+ behavior: standalone Markdown ### separators are not
+  // chapter text. Keep all other original characters (including bare 1/2).
+  const lines = text.replace(/\r\n/g, '\n').split('\n')
+    .filter(line => !/^#{2,6}$/.test(line.trim()));
+  const normalized = lines.join('\n');
+  const positions = [];
+  for (let index = 0; index < lines.length; index++) {
+    if (isTxtChapterHeading(lines[index])) positions.push(index);
+  }
+  // One isolated heading in a long book cannot establish a TOC; use virtual
+  // chapters instead. Files with multiple recognizable chapters retain titles.
+  if (positions.length < 2) {
+    if (!positions.length || normalized.length > VIRTUAL_TXT_CHAPTER_CHARS) {
+      return splitTxtIntoVirtualChapters(normalized);
+    }
+  }
+  const chapters = [];
+  if (positions.length && positions[0] > 0) {
+    const intro = lines.slice(0, positions[0]).join('\n').trim();
+    if (intro) chapters.push({title:'前文', content:intro});
+  }
+  positions.forEach((start, index) => {
+    const end = index + 1 < positions.length ? positions[index + 1] : lines.length;
+    chapters.push({
+      title: lines[start].trim().replace(/^#{1,6}\s*/, '').replace(/\s*#{1,6}$/, '').trim(),
+      content: lines.slice(start, end).join('\n').trim()
+    });
+  });
+  return chapters.length ? chapters : splitTxtIntoVirtualChapters(normalized);
+}
+
+// Old single-chapter reading offsets were measured from the entire book.
+// Convert those offsets only when necessary and avoid treating new per-chapter
+// Android positions as old whole-book ratios. Existing other-book progress and
+// EPUB positions are unchanged.
+function normalizeVirtualTxtProgress(position, chapters, isWebSlot = false) {
+  if (!position || !chapters[0]?.virtualChapter) return position;
+  if ((Number(position.chapterIndex) || 0) !== 0 ||
+      Number(position.chapterMapVersion) >= VIRTUAL_TXT_CHAPTER_VERSION) return position;
+  const firstLength = chapters[0].content.length;
+  const absoluteOffset = Number(position.charOffset) || 0;
+  let absolute = null;
+  const originalRatio = Number(position.ratio ?? position.pageRatio ?? position.scrollRatio ?? 0);
+  const localRatio = firstLength > 0 ? absoluteOffset / firstLength : 0;
+  // Old Android versions often stored a whole-book charOffset together with
+  // a whole-book ratio, even while the renderer showed only 4000 chars.
+  if (absoluteOffset > 0 && (absoluteOffset >= firstLength || isWebSlot ||
+      (Number.isFinite(originalRatio) && Math.abs(originalRatio - localRatio) > 0.02))) {
+    absolute = absoluteOffset;
+  } else if (isWebSlot && absoluteOffset === 0) {
+    // Desktop v40 saved only scrollRatio for an entire 全文 chapter.
+    const r = Number(position.scrollRatio ?? position.pageRatio ?? 0);
+    if (r > 0 && r <= 1) {
+      const total = chapters.reduce((sum, part) => sum + part.content.length, 0);
+      absolute = Math.floor(total * r);
+    }
+  }
+  if (absolute === null) return position;
+  let remaining = absolute;
+  for (let i = 0; i < chapters.length; i++) {
+    const length = chapters[i].content.length;
+    if (remaining < length || i === chapters.length - 1) {
+      const offset = Math.min(Math.max(0, remaining), length);
+      const ratio = length ? offset / length : 0;
+      return {...position, chapterIndex:i, charOffset:offset,
+        scrollRatio:ratio, pageRatio:ratio,
+        chapterMapVersion:VIRTUAL_TXT_CHAPTER_VERSION};
+    }
+    remaining -= length;
+  }
+  return position;
 }
 
 
@@ -1126,63 +1097,71 @@ function renderTxtChapter(
 ========================================================= */
 
 function renderTxtToc() {
+  tocSection.classList.remove('hidden');
+  tocList.innerHTML = '';
+  const total = txtChapters.length;
+  // A 40 MB TXT can have ~10,000 synthetic chapters. Only render a
+  // navigable window, not 10,000 DOM buttons on every chapter turn.
+  const windowSize = 160;
+  const paged = total > 300;
+  const start = paged ? Math.max(0,
+    Math.min(total - windowSize, currentTxtChapter - Math.floor(windowSize / 2))) : 0;
+  const end = paged ? Math.min(total, start + windowSize) : total;
 
-  tocSection.classList.remove(
-    "hidden"
-  );
-
-
-  tocList.innerHTML = "";
-
-
-  txtChapters.forEach(
-    (chapter, index) => {
-
-      const button =
-        document.createElement(
-          "button"
-        );
-
-
-      button.className =
-        "toc-item";
-
-
-      if (
-        index ===
-        currentTxtChapter
-      ) {
-
-        button.classList.add(
-          "active"
-        );
-
+  if (paged) {
+    const controls = document.createElement('div');
+    controls.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:6px 0 10px';
+    const count = document.createElement('span');
+    count.textContent = `${start + 1}~${end} / ${total}장`;
+    controls.appendChild(count);
+    const jump = document.createElement('input');
+    jump.type = 'number';
+    jump.min = '1'; jump.max = String(total);
+    jump.value = String(currentTxtChapter + 1);
+    jump.setAttribute('aria-label','이동할 장 번호');
+    jump.style.cssText = 'width:70px;min-width:0;padding:5px;font-size:14px';
+    const go = document.createElement('button');
+    go.textContent = '이동';
+    go.className = 'toc-item';
+    go.style.cssText = 'width:auto;padding:5px 8px';
+    const navigate = () => {
+      const requested = Number(jump.value);
+      if (Number.isInteger(requested) && requested >= 1 && requested <= total) {
+        void moveTxtChapter(requested - 1);
       }
-
-
-      button.textContent =
-        chapter.title;
-
-
-      button.addEventListener(
-        "click",
-        () => {
-
-          moveTxtChapter(
-            index
-          );
-
-        }
-      );
-
-
-      tocList.appendChild(
-        button
-      );
-
-    }
-  );
-
+    };
+    go.addEventListener('click', navigate);
+    jump.addEventListener('keydown', e => {if (e.key === 'Enter') navigate();});
+    controls.appendChild(jump); controls.appendChild(go);
+    tocList.appendChild(controls);
+    const rangeButton = (text, index) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'toc-item';
+      button.textContent = text;
+      button.addEventListener('click', () => {void moveTxtChapter(index);});
+      tocList.appendChild(button);
+    };
+    if (start > 0) rangeButton(`↑ 이전 목차 (${Math.max(1,start - windowSize + 1)}장부터)`,
+      Math.max(0,start - windowSize));
+  }
+  for (let index = start; index < end; index++) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'toc-item';
+    if (index === currentTxtChapter) button.classList.add('active');
+    button.textContent = txtChapters[index].title;
+    button.addEventListener('click', () => {void moveTxtChapter(index);});
+    tocList.appendChild(button);
+  }
+  if (paged && end < total) {
+    const next = document.createElement('button');
+    next.type = 'button';
+    next.className = 'toc-item';
+    next.textContent = `↓ 다음 목차 (${end + 1}장부터)`;
+    next.addEventListener('click', () => {void moveTxtChapter(end);});
+    tocList.appendChild(next);
+  }
 }
 
 
@@ -1231,7 +1210,7 @@ async function moveTxtChapter(
 
       chapterIndex:
         currentTxtChapter,
-
+      chapterMapVersion: txtChapters[0]?.virtualChapter ? VIRTUAL_TXT_CHAPTER_VERSION : undefined,
       scrollRatio: restoreRatio,
       pageRatio: restoreRatio
 
@@ -1339,7 +1318,7 @@ function saveTxtScroll() {
 
       chapterIndex:
         currentTxtChapter,
-
+      chapterMapVersion: txtChapters[0]?.virtualChapter ? VIRTUAL_TXT_CHAPTER_VERSION : undefined,
       scrollRatio:
         ratio
 
@@ -3072,6 +3051,7 @@ function rememberMobileTxtProgress() {
     mobilePageState.txtPageIndex / (mobilePageState.txtPages - 1);
   readerState.txtProgress[selectedBook.id] = {
     chapterIndex:currentTxtChapter,
+    chapterMapVersion: txtChapters[0]?.virtualChapter ? VIRTUAL_TXT_CHAPTER_VERSION : undefined,
     scrollRatio:ratio,
     pageRatio:ratio
   };
@@ -4092,12 +4072,12 @@ document.documentElement.dataset.readerBuild = 'v37-cloudflare-sync-errors';
   document.head.appendChild(style);
   if ("serviceWorker" in navigator && location.protocol === "https:") {
     window.addEventListener("load", () => {
-      navigator.serviceWorker.register("./sw.js?v=36").then(reg => {
+      navigator.serviceWorker.register("./sw.js?v=41").then(reg => {
         reg.update().catch(() => {});
         // 강제로 캐시를 삭제하지 않고 새 서비스 워커 활성화 후 한 번만 다시 읽습니다.
         navigator.serviceWorker.addEventListener('controllerchange', () => {
-          if (sessionStorage.getItem('reader-v36-web-settings-update-done') !== '1') {
-            sessionStorage.setItem('reader-v36-web-settings-update-done','1');
+          if (sessionStorage.getItem('reader-v41-virtual-toc-done') !== '1') {
+            sessionStorage.setItem('reader-v41-virtual-toc-done','1');
             location.reload();
           }
         });
@@ -4289,6 +4269,7 @@ function saveVirtualMobileTxtProgress() {
   const ratio = offset / length;
   readerState.txtProgress[selectedBook.id] = {
     chapterIndex: currentTxtChapter,
+    chapterMapVersion: txtChapters[0]?.virtualChapter ? VIRTUAL_TXT_CHAPTER_VERSION : undefined,
     charOffset: offset,
     scrollRatio: ratio,
     pageRatio: ratio
@@ -4465,7 +4446,7 @@ const OFFLINE_READER_DB = "drive-novel-offline-v1";
 const OFFLINE_READER_STORE = "books";
 const TXT_PARSED_STORE = "txtChapters";
 const TXT_LAYOUT_STORE = "txtLayouts";
-const TXT_CACHE_FORMAT_VERSION = 15; // 인코딩 수정 전 깨진 TXT 캐시 무효화
+const TXT_CACHE_FORMAT_VERSION = 16; // v41: 원본 TXT에서 가상 목차 다시 생성
 const OFFLINE_BOOK_INDEX_KEY = "driveReaderOfflineBookIndexV1";
 const OFFLINE_LOCAL_STATE_KEY = "driveReaderLastLocalStateV1";
 const OFFLINE_PENDING_STATE_KEY = "driveReaderPendingSyncV1";
