@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kuro Reader - 개인정보처리방침</title>
+  <style>
+    body { max-width: 800px; margin: 0 auto; padding: 28px 20px 56px; font: 16px/1.75 system-ui,-apple-system,"Noto Sans KR",sans-serif; color: #25302b; background: #fafbf9; }
+    h1 { font-size: 1.75rem; line-height: 1.35; } h2 { font-size: 1.15rem; margin-top: 28px; } a { color: #146b51; }
+    .meta { color: #58655e; } footer { border-top: 1px solid #d8e0da; margin-top: 34px; padding-top: 12px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Kuro Reader 개인정보처리방침</h1>
+    <p class="meta">시행일: 2026년 11월 26일</p>
+    <p>Kuro Reader는 개인용 전자책(TXT·EPUB) 읽기 서비스입니다. 이 문서는 서비스를 사용할 때 어떤 데이터가 처리되는지 설명합니다.</p>
+    <h2>1. 처리하는 정보</h2>
+    <p>소설 파일과 폴더의 이름·식별자·파일 내용, 독서 진행 위치, 읽기 화면 설정, 앱 또는 웹의 연결을 위한 인증 정보(기기 토큰 등)를 서비스 제공에 필요한 범위에서 처리할 수 있습니다.</p>
+    <h2>2. Google Drive 권한 사용</h2>
+    <p>사용자가 Google 계정에서 승인한 Google Drive 권한은 서재의 파일·폴더 조회, 전자책 다운로드·업로드, 이름 변경, 이동, 삭제 등 사용자가 요청한 파일 관리 기능을 제공하기 위해 사용합니다. 서비스가 요청하는 전체 Drive 접근 권한은 사용자가 허용한 계정의 다른 Drive 파일에도 기술적으로 접근할 수 있는 넓은 권한입니다.</p>
+    <h2>3. 저장 위치와 목적</h2>
+    <p>전자책 원본은 Google Drive에 보관됩니다. Cloudflare Workers는 Google Drive와 웹·앱 사이의 요청을 처리합니다. Cloudflare R2에는 서재 최상위의 전자책 파일이 재다운로드를 줄이기 위해 캐시될 수 있습니다. Cloudflare D1에는 웹과 앱의 독서 진행 위치 및 설정이 보관될 수 있습니다. 기기의 오프라인 저장소와 브라우저에도 전자책 및 설정의 사본이 저장될 수 있습니다.</p>
+    <h2>4. 외부 서비스 및 공유</h2>
+    <p>기능을 제공하기 위해 Google Drive, Cloudflare, GitHub Pages 등의 인프라를 사용합니다. 이 과정에서 데이터가 해당 서비스 제공자의 시스템에서 처리될 수 있습니다. Kuro Reader는 수집한 데이터를 광고 목적으로 사용하지 않으며 데이터 판매 기능을 제공하지 않습니다.</p>
+    <h2>5. 보관과 삭제</h2>
+    <p>Google Drive 원본 파일은 사용자가 Drive에서 관리할 수 있습니다. 브라우저 및 Android 앱의 로컬 저장 데이터는 해당 기기의 데이터 삭제 기능 등으로 지울 수 있습니다. Cloudflare D1의 진도·설정 기록과 R2 캐시는 서비스 관리자가 해당 저장소에서 관리·삭제할 수 있습니다. Google 계정의 연결 권한은 Google 계정 설정에서 취소할 수 있습니다.</p>
+    <h2>6. 보안과 문의</h2>
+    <p>인증 토큰과 서버 설정을 이용해 접근을 관리합니다. 인터넷을 통한 데이터 전송에는 위험이 있으므로 완전한 보안을 보장하지는 않습니다. 이용 관련 문의는 Google OAuth 동의 화면에 표시된 개발자 지원 연락처를 이용해 주세요.</p>
+    <h2>7. 방침 변경</h2>
+    <p>기능이나 데이터 처리 방법이 달라지면 이 문서의 내용과 시행일을 갱신할 수 있습니다.</p>
+  </main>
+  <footer><a href="./">Kuro Reader 홈페이지</a> · <a href="./terms.html">서비스 이용약관</a></footer>
+</body>
+</html>
